@@ -1,0 +1,10 @@
+LIBRARY xinput1_3.dll
+EXPORTS
+    XInputGetState = pso_core.XInputGetState @2
+    XInputSetState = pso_core.XInputSetState @3
+    XInputGetCapabilities = pso_core.XInputGetCapabilities @4
+    XInputEnable = pso_core.XInputEnable @5
+    XInputGetDSoundAudioDeviceGuids = pso_core.XInputGetDSoundAudioDeviceGuids @6
+    XInputGetBatteryInformation = pso_core.XInputGetBatteryInformation @7
+    XInputGetKeystroke = pso_core.XInputGetKeystroke @8
+    Ord100 = pso_core.#100 @100 NONAME
