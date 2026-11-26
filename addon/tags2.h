@@ -6,6 +6,8 @@
 typedef struct { wchar_t tag[20]; int mode; float rgb[3]; } TagCol;      /* mode 1 colour, 2 rainbow */
 #define MAXTAG 256
 static TagCol g_tab[2][MAXTAG]; static int g_tabn[2]; static volatile int g_tabi; static volatile LONG g_tab_ver;
+static void clown3d_tick(void); static void goalvid_tick(void); static void region_tick(void);
+static volatile LONG g_bc, g_bc_rt; static volatile DWORD g_hb_tick; static DWORD g_gt_id;
 static char g_tsrv[128];
 static uintptr_t g_tb_class; static int32_t g_text_off = -1, g_col_off = -1;
 static int32_t g_sw_off = -1, g_sc_off = -1;      /* UTextBlock -> STextBlock pointer, STextBlock -> colour value */
@@ -34,13 +36,15 @@ static void tags_parse(char *txt) {
     }
     g_tabn[w] = n; g_tabi = w; InterlockedIncrement(&g_tab_ver);
 }
-static int tags_fetch(void) {
-    int ok = 0;
-    wchar_t host[128]; MultiByteToWideChar(CP_UTF8, 0, g_tsrv, -1, host, 128);
-    HINTERNET s = WinHttpOpen(L"pso", WINHTTP_ACCESS_TYPE_NO_PROXY, NULL, NULL, 0), c = NULL, r = NULL;
-    if (!s) return 0;
-    WinHttpSetTimeouts(s, 4000, 4000, 4000, 6000);
-    if ((c = WinHttpConnect(s, host, 443, 0)) && (r = WinHttpOpenRequest(c, L"GET", L"/pso-tags", NULL, NULL, NULL, WINHTTP_FLAG_SECURE))) {
+static int tags_fetch(void) {        /* one kept-open connection (no new TLS handshake each time) */
+    static HINTERNET s, c; int ok = 0; HINTERNET r = NULL;
+    if (!s) {
+        wchar_t host[128]; MultiByteToWideChar(CP_UTF8, 0, g_tsrv, -1, host, 128);
+        if (!(s = WinHttpOpen(L"pso", WINHTTP_ACCESS_TYPE_NO_PROXY, NULL, NULL, 0))) return 0;
+        WinHttpSetTimeouts(s, 4000, 4000, 4000, 6000);
+        if (!(c = WinHttpConnect(s, host, 443, 0))) { WinHttpCloseHandle(s); s = NULL; return 0; }
+    }
+    if ((r = WinHttpOpenRequest(c, L"GET", L"/pso-tags", NULL, NULL, NULL, WINHTTP_FLAG_SECURE))) {
         DWORD fl = SECURITY_FLAG_IGNORE_UNKNOWN_CA | SECURITY_FLAG_IGNORE_CERT_CN_INVALID | SECURITY_FLAG_IGNORE_CERT_DATE_INVALID;
         WinHttpSetOption(r, WINHTTP_OPTION_SECURITY_FLAGS, &fl, sizeof fl);
         if (WinHttpSendRequest(r, NULL, 0, NULL, 0, 0, 0) && WinHttpReceiveResponse(r, NULL)) {
@@ -48,13 +52,16 @@ static int tags_fetch(void) {
             WinHttpQueryHeaders(r, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER, NULL, &code, &sz, NULL);
             while (len < sizeof buf - 1 && WinHttpReadData(r, buf + len, sizeof buf - 1 - len, &got) && got) len += got;
             buf[len] = 0;
-            if (code == 200 && !strncmp(buf, "#tags", 5)) { tags_parse(buf); ok = 1; }
+            if (code == 200 && !strncmp(buf, "#tags", 5)) {
+                static char last[32768];
+                if (strcmp(buf, last)) { memcpy(last, buf, len + 1); tags_parse(buf); }   /* only redo colours when the list changed */
+                ok = 1;
+            }
             else { static int once; if (!once++) { buf[60] = 0; logf_("tags: server gave no colour list (code %lu)", code); } }
         }
+        WinHttpCloseHandle(r);
     }
-    if (r) WinHttpCloseHandle(r);
-    if (c) WinHttpCloseHandle(c);
-    WinHttpCloseHandle(s);
+    if (!ok) { WinHttpCloseHandle(c); WinHttpCloseHandle(s); s = c = NULL; }
     return ok;
 }
 static int wr_(uintptr_t a, const void *b, SIZE_T n) { SIZE_T p = 0; return WriteProcessMemory(g_proc, (LPVOID)a, b, n, &p) && p == n; }
@@ -171,11 +178,11 @@ static DWORD WINAPI tags_worker(LPVOID u) {
     (void)u;
     g_proc = GetCurrentProcess();
     if (!refl_init()) return 0;
-    logf_("---- name tag colours (add-on v45) ----");
+    logf_("---- name tag colours (add-on v86) ----");
     DWORD last_fetch = 0, last_scan = 0; int logged = 0, fetched = 0;
     for (;;) {
         DWORD now = GetTickCount();
-        if (!last_fetch || now - last_fetch > 5000) { last_fetch = now; if (tags_fetch()) { static int lastn = -1; if (g_tabn[g_tabi] != lastn) { lastn = g_tabn[g_tabi]; logf_("tags: colour list: %d tag(s)", lastn); } } (void)fetched; }
+        if (!last_fetch || now - last_fetch > 30000) { last_fetch = now; if (tags_fetch()) { static int lastn = -1; if (g_tabn[g_tabi] != lastn) { lastn = g_tabn[g_tabi]; logf_("tags: colour list: %d tag(s)", lastn); } } (void)fetched; }
         if (!g_tb_class) {
             if (now - last_scan > 3000) {
                 last_scan = now;
@@ -191,8 +198,8 @@ static DWORD WINAPI tags_worker(LPVOID u) {
             }
             Sleep(200); continue;
         }
-        if (!g_ch_vt) { static DWORD lh; if (now - lh > 700) { lh = now; ch_try_hook(); } }
-        if (now - last_scan > 1500) {
+        if (!g_ch_vt) { static DWORD lh; if (now - lh > 3000) { lh = now; ch_try_hook(); } }
+        if (now - last_scan > 2000) {
             anim_setup_and_scan();
             static int reports;
             last_scan = now; g_tb_seen = g_uid_seen = 0; for_each_object(tw_cb, NULL);
@@ -280,8 +287,67 @@ static int ch_build(const wchar_t *msg, int len, wchar_t *out, int cap) {
     (void)len;
     return n;
 }
+static void ch_param_text(uintptr_t fn, void *parms, const char *name, char *out, int cap) {     /* a text / string parameter, as plain ASCII */
+    int32_t off = -1; wchar_t w[64] = L""; int z = 0;
+    snprintf(out, cap, "(no such parameter)");
+    if (!prop_off(find_prop(fn, name), &off) || off < 0 || off > 0x200) return;
+    TArr *s = (TArr *)((char *)parms + off);
+    if (!(s->num >= 1 && s->num <= 60 && s->max >= s->num && s->ptr > 0x10000 && !(s->ptr & 1) && rd(s->ptr, w, (SIZE_T)s->num * 2) && !w[s->num - 1])) {
+        w[0] = 0; if (!text_of(*(uintptr_t *)s, w, 60)) { snprintf(out, cap, "(empty)"); return; }
+    }
+    for (; w[z] && z < cap - 1; z++) out[z] = w[z] < 128 ? (char)w[z] : '?'; out[z] = 0;
+}
+static int ch_str_at(uintptr_t a, wchar_t *w, int cap) {              /* is there a readable string header (pointer, length, capacity) at this address? */
+    TArr s; if (!rd(a, &s, sizeof s) || s.num < 2 || s.num > cap || s.max < s.num || s.max > 4096 || s.ptr < 0x10000 || (s.ptr & 1)) return 0;
+    if (!rd(s.ptr, w, (SIZE_T)s.num * 2) || w[s.num - 1]) return 0;
+    for (int i = 0; i < s.num - 1; i++) if (w[i] < 0x20) return 0;
+    return 1;
+}
+static int ch_param_wide(uintptr_t fn, void *parms, const char *name, wchar_t *w, int cap) {     /* a text / string parameter, wherever the game keeps its characters */
+    int32_t off = -1; w[0] = 0;
+    if (!prop_off(find_prop(fn, name), &off) || off < 0 || off > 0x200) return 0;
+    uintptr_t base = (uintptr_t)parms + off, td = 0;
+    if (ch_str_at(base, w, cap)) return 1;                                              /* a plain string */
+    if (!rdp(base, &td) || td < 0x10000) { w[0] = 0; return 0; }
+    for (int o = 8; o <= 0x90; o += 8) if (ch_str_at(td + o, w, cap)) return 1;         /* inside the text object */
+    for (int o = 8; o <= 0x90; o += 8) { uintptr_t q = 0; if (!rdp(td + o, &q) || q < 0x10000 || (q & 7)) continue;      /* or one step away from it */
+        for (int o2 = 0; o2 <= 0x40; o2 += 8) if (ch_str_at(q + o2, w, cap)) return 1; }
+    w[0] = 0; return 0;
+}
+static void ch_goal(uintptr_t fn, void *parms) {                 /* a goal: note who scored, start the celebration */
+    static int logs;
+    { wchar_t w[48]; int got = ch_param_wide(fn, parms, "ScorerName", w, 40); memcpy(g_goal_scorer, w, sizeof w);
+      static int lg; if (lg++ < 6) { char a[48]; int z = 0; for (; w[z] && z < 47; z++) a[z] = w[z] < 128 ? (char)w[z] : '?'; a[z] = 0; int32_t off = -1; prop_off(find_prop(fn, "ScorerName"), &off);
+          uint64_t q[4] = {0}, d[10] = {0}; if (off >= 0 && off < 0x200) { memcpy(q, (char *)parms + off, 24); if (q[0] > 0x10000) rd((uintptr_t)q[0], d, sizeof d); }
+          logf_("goal fx: scorer name %s '%s' | raw %llx %llx %llx | text object %llx %llx %llx %llx %llx %llx %llx %llx %llx %llx", got ? "read" : "NOT read", a, (unsigned long long)q[0], (unsigned long long)q[1], (unsigned long long)q[2],
+                (unsigned long long)d[0], (unsigned long long)d[1], (unsigned long long)d[2], (unsigned long long)d[3], (unsigned long long)d[4], (unsigned long long)d[5], (unsigned long long)d[6], (unsigned long long)d[7], (unsigned long long)d[8], (unsigned long long)d[9]); } }
+    if (logs++ < 40) { char team[64], sc[64], as[64]; int32_t ob = -1; int wa = -1;
+        ch_param_text(fn, parms, "TeamScoreText", team, sizeof team); ch_param_text(fn, parms, "ScorerName", sc, sizeof sc); ch_param_text(fn, parms, "AssisterName", as, sizeof as);
+        if (prop_off(find_prop(fn, "WithAssist?"), &ob) && ob >= 0 && ob < 0x200) wa = ((unsigned char *)parms)[ob];
+        logf_("goal fx: goal - team text '%s', scorer '%s', assist '%s', with assist %d", team, sc, as, wa); }
+    goalfx_goal();
+}
+static uintptr_t g_ms_in, g_ms_out;
 static void ch_hook(void *self, void *fn, void *parms) {
-    if (!g_ch_fn && fn) { char nm[96]; if (obj_name((uintptr_t)fn, nm, sizeof nm) && !strcmp(nm, "MP_HUD-RecieveChatMessage")) g_ch_fn = (uintptr_t)fn; }
+    if (fn && (uintptr_t)fn != g_ch_fn && (uintptr_t)fn != g_goal_fn) {
+        /* Each function is looked up by name once (game thread: keep it cheap). The game reloads these functions
+           on every new match, so the answers are forgotten every 20 s and a new match is picked up again. */
+        static uintptr_t no[1024]; static int nno; static DWORD born;
+        DWORD nowt = GetTickCount(); if (nowt - born > 20000) { memset(no, 0, sizeof no); nno = 0; born = nowt; g_ms_in = g_ms_out = 0; }
+        unsigned h = (unsigned)(((uintptr_t)fn >> 4) * 2654435761u) >> 22; int known = nno >= 900;
+        for (int k = 0; k < 1024 && !known; k++, h = (h + 1) & 1023) { if (no[h] == (uintptr_t)fn) known = 1; else if (!no[h]) break; }
+        if (!known) { char nm[96] = "";
+            obj_name((uintptr_t)fn, nm, sizeof nm);
+            if (!strcmp(nm, "MP_HUD-RecieveChatMessage")) g_ch_fn = (uintptr_t)fn;
+            else if (!strncmp(nm, "MP_HUD-GoalStateFadeIn", 22)) { g_goal_fn = (uintptr_t)fn; static int lg; if (lg++ < 10) logf_("goal fx: goal event found"); }
+            else { if (!strcmp(nm, "MP_HUD-MatchStateFadeIn")) g_ms_in = (uintptr_t)fn; else if (!strcmp(nm, "MP_HUD-MatchStateFadeOut")) g_ms_out = (uintptr_t)fn;
+                   no[h] = (uintptr_t)fn; nno++; } }
+        /* the pop-up in the middle of the screen (kick-off countdown etc.) is shown and hidden by messages from the match server:
+           note when each arrives, so a pop-up that stays on screen can be traced (did "hide" arrive or not?) */
+        if ((uintptr_t)fn == g_ms_in || (uintptr_t)fn == g_ms_out) { static int lg; if (lg++ < 120) logf_("match pop-up: the server's \"%s\" message arrived", (uintptr_t)fn == g_ms_in ? "show" : "hide"); }
+    }
+    if (GetCurrentThreadId() == g_gt_id) { g_bc = 7; clown3d_tick(); g_bc = 0; }
+    if (fn && (uintptr_t)fn == g_goal_fn && parms) { g_gfx_pc_hint = (uintptr_t)self; ch_goal((uintptr_t)fn, parms); }
     if (fn && (uintptr_t)fn == g_ch_fn && parms && *(uintptr_t *)self == g_ch_vt) {
         TArr *hit = NULL; TArr save;
         for (int off = 0; off + 16 <= 0x100 && !hit; off += 8) {
@@ -324,7 +390,7 @@ typedef struct { uintptr_t obj; int32_t idx, serial; DWORD born; wchar_t msg[200
 #define MAXRL 24
 static RLine g_rl[MAXRL]; static volatile LONG g_nrl_lines; static CRITICAL_SECTION g_rlcs; static int g_rl_init;
 static uintptr_t g_rtb_cls, g_fn_settext, g_fn_s2t, g_kt_cdo; static int32_t g_rtb_text = -1;
-static uintptr_t g_uw_vt; static ch_pe_fn g_uw_orig; static DWORD g_anim_last, g_gt_id;
+static uintptr_t g_uw_vt; static ch_pe_fn g_uw_orig; static DWORD g_anim_last;
 static int rl_alive(RLine *r) {
     uintptr_t it = obj_item_rd(r->idx), o = 0; int32_t fl = 0, ser = 0;
     return it && rdp(it, &o) && o == r->obj && rd(it + 8, &fl, 4) && !(fl & 0x30000000) && rd(it + 0x10, &ser, 4) && ser == r->serial;
@@ -355,7 +421,7 @@ static void anim_pump(void) {
         if (n <= 0) continue;
         struct { uintptr_t ptr; int32_t num, max; uintptr_t text[3]; uint8_t spare[32]; } P1;
         memset(&P1, 0, sizeof P1); P1.ptr = (uintptr_t)buf; P1.num = n + 1; P1.max = n + 1;
-        ch_pe_fn upe = (ch_pe_fn)(g_exe + 0x10f7ef0);                         /* UObject::ProcessEvent */
+        ch_pe_fn upe = (ch_pe_fn)(g_exe + RVA_PE);                         /* UObject::ProcessEvent */
         upe((void *)g_kt_cdo, (void *)g_fn_s2t, &P1);                          /* FText made by the game */
         if (!P1.text[0] || !P1.text[1]) continue;
         struct { uintptr_t text[3]; uint8_t spare[32]; } P2; memset(&P2, 0, sizeof P2); memcpy(P2.text, P1.text, 24);
@@ -366,10 +432,12 @@ static void anim_pump(void) {
 }
 static void theme_pump(void *self);
 static void theme_binding_fix(void *self, void *fn, void *parms);
+static void goaltab_tick(void *self);
 static void uw_hook(void *self, void *fn, void *parms) {
     g_uw_orig(self, fn, parms);
-    theme_binding_fix(self, fn, parms);
-    if (GetCurrentThreadId() == g_gt_id) { anim_pump(); theme_pump(self); }
+    if (GetCurrentThreadId() != g_gt_id) { theme_binding_fix(self, fn, parms); return; }
+    g_bc = 2; theme_binding_fix(self, fn, parms);
+    g_bc = 3; anim_pump(); g_bc = 4; theme_pump(self); g_bc = 5; goaltab_tick(self); g_bc = 8; goalvid_tick(); region_tick(); g_bc = 6; clown3d_tick(); g_bc = 0;
 }
 typedef struct { int pass; } AnimFind;
 static int anim_cb(uintptr_t o, uintptr_t cls, void *ctx) {

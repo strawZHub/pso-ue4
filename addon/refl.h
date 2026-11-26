@@ -1,22 +1,51 @@
-/* Minimal UE 4.27 reflection for ProSoccerOnline-Win64-Shipping.exe (this exact build).
+/* Minimal UE 4.27 reflection for ProSoccerOnline-Win64-Shipping.exe (two known builds).
  * All reads go through ReadProcessMemory so a bad pointer can never crash the game. */
-#define RVA_GOBJ_OBJECTS 0x4519250   /* FChunkedFixedUObjectArray::Objects (GUObjectArray+0x10) */
-#define RVA_NAMEPOOL     0x44dcbc0   /* FNamePool */
-#define EXE_SIZE_CHECK   75652096
+typedef struct { int64_t size; uintptr_t gobj, pe, names[2]; const char *label; } GameBuild;
+static const GameBuild BUILDS[] = {
+    { 75652096, 0x4519250, 0x10f7ef0, { 0x44dcbc0, 0 },         "Sep 2024" },
+    { 75403776, 0x44e4180, 0x10d8e60, { 0x44a7c40, 0x44dcbc0 }, "Aug 2024" },
+};
+static uintptr_t g_rva_gobj, g_rva_names, g_rva_pe;
+static const char *g_build = "";   /* FChunkedFixedUObjectArray::Objects, FNamePool, UObject::ProcessEvent */
+#define RVA_GOBJ_OBJECTS g_rva_gobj
+#define RVA_NAMEPOOL     g_rva_names
+#define RVA_PE           g_rva_pe
 
 static uintptr_t g_exe;
 
 static int rdp(uintptr_t a, uintptr_t *out) { return a > 0x10000 && rd(a, out, 8); }
+static int name0_is_none(uintptr_t pool) {                 /* FName index 0 is always "None" */
+    uintptr_t block; uint16_t hdr; char t[5] = "";
+    if (!rdp(g_exe + pool + 0x10, &block) || !rd(block, &hdr, 2) || (hdr >> 6) != 4 || !rd(block + 2, t, 4)) return 0;
+    return !memcmp(t, "None", 4);
+}
 
+static void rd_fast_init(void);
 static int refl_init(void) {
+    static volatile int state;                             /* 0 = not yet, 1 = ok, -1 = off */
+    if (state) return state > 0;
+    rd_fast_init();
     char path[MAX_PATH];
     g_exe = (uintptr_t)GetModuleHandleA(NULL);
     GetModuleFileNameA(NULL, path, MAX_PATH);
     HANDLE f = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
     LARGE_INTEGER sz = {0};
     if (f != INVALID_HANDLE_VALUE) { GetFileSizeEx(f, &sz); CloseHandle(f); }
-    if (sz.QuadPart != EXE_SIZE_CHECK) { logf_("add-on: different game build, disabled"); return 0; }
-    return 1;
+    const GameBuild *b = NULL;
+    for (unsigned i = 0; i < sizeof BUILDS / sizeof BUILDS[0]; i++) if (BUILDS[i].size == sz.QuadPart) b = &BUILDS[i];
+    if (!b) { logf_("add-on: different game build, disabled"); state = -1; return 0; }
+    g_rva_gobj = b->gobj; g_rva_pe = b->pe; g_rva_names = b->names[0];
+    if (b->names[1]) {                                      /* two candidates: the one whose first name is "None" */
+        for (int t = 0; t < 600 && !g_rva_names; t++) Sleep(100);
+        for (int t = 0; t < 600; t++) {
+            if (name0_is_none(b->names[0])) { g_rva_names = b->names[0]; break; }
+            if (name0_is_none(b->names[1])) { g_rva_names = b->names[1]; break; }
+            Sleep(100);
+        }
+    }
+    if (!name0_is_none(g_rva_names)) { logf_("add-on: game names not found (%s build), disabled", b->label); state = -1; return 0; }
+    g_build = b->label; logf_("add-on: game build %s", b->label);
+    state = 1; return 1;
 }
 
 /* FName -> text (ANSI names only; wide names are returned empty) */
@@ -42,11 +71,15 @@ static uintptr_t obj_class(uintptr_t o) { uintptr_t c = 0; rdp(o + 0x10, &c); re
 
 /* walk every live UObject; cb returns 1 to stop */
 typedef int (*obj_cb)(uintptr_t obj, uintptr_t cls, void *ctx);
-static void for_each_object(obj_cb cb, void *ctx) {
-    static unsigned char items[65536 * 24];
+static volatile LONG g_scan_busy; static volatile DWORD g_scan_end;      /* for the stutter notes: is a look through the game's objects running, when did the last one end */
+static void for_each_object_(obj_cb cb, void *ctx);
+static void for_each_object(obj_cb cb, void *ctx) { InterlockedIncrement(&g_scan_busy); for_each_object_(cb, ctx); InterlockedDecrement(&g_scan_busy); g_scan_end = GetTickCount(); }
+static void for_each_object_(obj_cb cb, void *ctx) {
+    /* each call gets its own work buffer: several of the add-on's threads walk the object list at the same time */
+    unsigned char *items = (unsigned char *)malloc(65536 * 24); if (!items) return;
     uintptr_t chunks; int32_t num;
-    if (!rdp(g_exe + RVA_GOBJ_OBJECTS, &chunks) || !rd(g_exe + RVA_GOBJ_OBJECTS + 0x14, &num, 4)) return;
-    if (num <= 0 || num > 4000000) return;
+    if (!rdp(g_exe + RVA_GOBJ_OBJECTS, &chunks) || !rd(g_exe + RVA_GOBJ_OBJECTS + 0x14, &num, 4)) { free(items); return; }
+    if (num <= 0 || num > 4000000) { free(items); return; }
     for (int c = 0; c * 65536 < num; c++) {
         uintptr_t chunk;
         if (!rdp(chunks + 8ULL * c, &chunk)) continue;
@@ -56,9 +89,10 @@ static void for_each_object(obj_cb cb, void *ctx) {
             uintptr_t o = *(uintptr_t *)(items + i * 24);
             if (o < 0x10000) continue;
             uintptr_t cls = obj_class(o);
-            if (cls && cb(o, cls, ctx)) return;
+            if (cls && cb(o, cls, ctx)) { free(items); return; }
         }
     }
+    free(items);
 }
 
 /* property lookup on a UClass (walks super classes). Returns FProperty* or 0 */

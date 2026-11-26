@@ -12,6 +12,7 @@ typedef struct {
     long long minutes;            /* -1 = unknown */
     long long last_played;        /* unix time, 0 = unknown */
     int ach_have, ach_total;      /* total 0 = unknown */
+    unsigned long long sid;       /* SteamID64 of the signed-in account */
 } SteamInfo;
 static SteamInfo g_steam;
 
@@ -125,11 +126,33 @@ static void read_achievements(const wchar_t *steam, unsigned accountid) {
     g_steam.ach_have = have > total ? total : have;
 }
 
+/* Linux / Mac (Wine, Proton, CrossOver): the real Steam folder is outside the Windows side, reached through drive Z:.
+   Wine passes the unix HOME on, so the usual places are tried. */
+static int is_wine(void) { HMODULE nt = GetModuleHandleW(L"ntdll.dll"); return nt && GetProcAddress(nt, "wine_get_version") != NULL; }
+static int has_loginusers(const wchar_t *dir) {
+    wchar_t p[MAX_PATH * 2]; swprintf(p, MAX_PATH * 2, L"%ls\\config\\loginusers.vdf", dir); return GetFileAttributesW(p) != INVALID_FILE_ATTRIBUTES;
+}
+static int unix_steam_dir(wchar_t *out, int cap) {
+    wchar_t home[MAX_PATH], w[MAX_PATH];                               /* Wine gives the home as WINEHOMEDIR=\??\Z:\home\name */
+    if (GetEnvironmentVariableW(L"WINEHOMEDIR", w, MAX_PATH) && wcslen(w) > 6) { const wchar_t *p = wcsncmp(w, L"\\??\\", 4) ? w : w + 4;
+        if ((p[0] == L'Z' || p[0] == L'z') && p[1] == L':') p += 2; swprintf(home, MAX_PATH, L"%ls", p); for (wchar_t *c = home; *c; c++) if (*c == L'\\') *c = L'/'; }
+    else if (!GetEnvironmentVariableW(L"HOME", home, MAX_PATH)) return 0;
+    if (home[0] != L'/') return 0;
+    static const wchar_t *sub[] = { L"/.steam/steam", L"/.local/share/Steam", L"/.steam/root", L"/.var/app/com.valvesoftware.Steam/.local/share/Steam",
+                                    L"/snap/steam/common/.local/share/Steam", L"/Library/Application Support/Steam" };
+    for (unsigned i = 0; i < sizeof sub / sizeof sub[0]; i++) {
+        wchar_t d[MAX_PATH * 2]; swprintf(d, MAX_PATH * 2, L"Z:%ls%ls", home, sub[i]);
+        for (wchar_t *c = d; *c; c++) if (*c == L'/') *c = L'\\';
+        if (has_loginusers(d)) { swprintf(out, cap, L"%ls", d); return 1; }
+    }
+    return 0;
+}
 static void read_steam_info(void) {
     g_steam.minutes = -1;
-    wchar_t steam[MAX_PATH]; DWORD sz = sizeof steam;
-    if (RegGetValueW(HKEY_CURRENT_USER, L"Software\\Valve\\Steam", L"SteamPath", RRF_RT_REG_SZ, NULL, steam, &sz)) return;
-    for (wchar_t *c = steam; *c; c++) if (*c == L'/') *c = L'\\';
+    wchar_t steam[MAX_PATH * 2]; DWORD sz = sizeof steam;
+    int reg = !RegGetValueW(HKEY_CURRENT_USER, L"Software\\Valve\\Steam", L"SteamPath", RRF_RT_REG_SZ, NULL, steam, &sz);
+    if (reg) for (wchar_t *c = steam; *c; c++) if (*c == L'/') *c = L'\\';
+    if ((!reg || !has_loginusers(steam)) && !(is_wine() && unix_steam_dir(steam, MAX_PATH * 2))) return;     /* Proton's own Steam folder has no accounts: use the real one */
     DWORD active = 0; sz = sizeof active;
     RegGetValueW(HKEY_CURRENT_USER, L"Software\\Valve\\Steam\\ActiveProcess", L"ActiveUser", RRF_RT_REG_DWORD, NULL, &active, &sz);
 
@@ -155,6 +178,7 @@ static void read_steam_info(void) {
     }
     if (!sid) return;
     unsigned accountid = (unsigned)(sid - 76561197960265728ULL);
+    g_steam.sid = sid;
     g_steam.ok = 1;
     MultiByteToWideChar(CP_UTF8, 0, name[0] ? name : "Steam player", -1, g_steam.name, 128);
     swprintf(g_steam.avatar_path, MAX_PATH * 2, L"%ls\\config\\avatarcache\\%llu.png", steam, sid);

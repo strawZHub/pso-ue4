@@ -67,12 +67,14 @@ static int col_new(int kind, const float *c, float *out) {        /* 1 = changed
 static int fld_type(uintptr_t p, char *out, int cap) { uintptr_t fc = 0; uint32_t n[2]; return rdp(p + 8, &fc) && rd(fc, n, 8) && name_str(n[0], n[1], out, cap); }
 static int fld_name(uintptr_t p, char *out, int cap) { uint32_t n[2]; return rd(p + 0x28, n, 8) && name_str(n[0], n[1], out, cap); }
 static int ci_has(const char *h, const char *n) { for (; *h; h++) if (!_strnicmp(h, n, strlen(n))) return 1; return 0; }
-typedef struct { uintptr_t addr; float orig[4], dark[4]; uint8_t is_fcolor; } Patch;
+typedef struct { uintptr_t addr, own; int32_t oidx, oser; float orig[4], dark[4]; uint8_t is_fcolor; } Patch;
+static uintptr_t g_tplown; static int32_t g_tplown_idx, g_tplown_ser;   /* the blueprint copy being read now */
+static uintptr_t obj_item_rd(int32_t idx);
 static Patch *g_tpl; static int g_ntpl, g_captpl;                  /* template (archetype) colours */
 static void patch_add(uintptr_t a, const float *o, const float *d, int fc) {
     EnterCriticalSection(&g_pcs);
     if (g_ntpl == g_captpl) { g_captpl = g_captpl ? g_captpl * 2 : 4096; g_tpl = realloc(g_tpl, sizeof(Patch) * g_captpl); }
-    Patch *p = &g_tpl[g_ntpl++]; p->addr = a; memcpy(p->orig, o, 16); memcpy(p->dark, d, 16); p->is_fcolor = (uint8_t)fc;
+    Patch *p = &g_tpl[g_ntpl++]; p->addr = a; p->own = g_tplown; p->oidx = g_tplown_idx; p->oser = g_tplown_ser; memcpy(p->orig, o, 16); memcpy(p->dark, d, 16); p->is_fcolor = (uint8_t)fc;
     LeaveCriticalSection(&g_pcs);
 }
 static float s2l(float v) { return v <= 0.04045f ? v / 12.92f : powf((v + 0.055f) / 1.055f, 2.4f); }
@@ -307,7 +309,7 @@ static void team_outline(uintptr_t o, int dark) {
     else { if (k < 0) return; memcpy(want, g_outl[k].orig, 16); }
     if (!memcmp(oc, want, 16)) return;
     memcpy(oc, want, 16);
-    ch_pe_fn upe = (ch_pe_fn)(g_exe + 0x10f7ef0); g_in_wrap = 1; upe((void *)o, (void *)setfont, P); g_in_wrap = 0;
+    ch_pe_fn upe = (ch_pe_fn)(g_exe + RVA_PE); g_in_wrap = 1; upe((void *)o, (void *)setfont, P); g_in_wrap = 0;
 }
 typedef struct { uintptr_t addr, umg; int32_t idx; float orig[4]; } SPatch;
 static SPatch g_sp[256]; static int g_nsp;
@@ -341,7 +343,9 @@ static int slate_bfs(uintptr_t umg, int32_t idx, uintptr_t *start, int nstart) {
     static int lg; if (lg < 8 && found) { lg++; logf_("theme: dropdown: %d drawn parts searched, %d copied navy colours made white", tail, found); }
     return found;
 }
+static int g_theme_bfs;                                              /* off: this search guessed where colours sit inside drawn widgets and could overwrite other data (the v81 dark-mode crashes) */
 static int slate_navy_fix(uintptr_t umg) {                           /* combo boxes built before the theme: their copied colours */
+    if (!g_theme_bfs) return 0;
     static uint8_t b[0x1800]; if (!rd(umg, b, sizeof b)) return 0;
     int32_t idx = -1; rd(umg + 0x0C, &idx, 4);
     uintptr_t st[32]; int ns = 0;
@@ -387,7 +391,7 @@ static void ufg_apply(int dark) {                                     /* game th
         float want[4] = { 0.92f, 0.92f, 0.92f, u->orig[3] }; if (!dark) memcpy(want, u->orig, 16);
         if (!memcmp(P, want, 16)) continue;
         memcpy(P, want, 16); P[16] = 0;
-        ch_pe_fn upe = (ch_pe_fn)(g_exe + 0x10f7ef0); g_in_wrap = 1; upe((void *)u->o, (void *)g_fn_setfg, P); g_in_wrap = 0;
+        ch_pe_fn upe = (ch_pe_fn)(g_exe + RVA_PE); g_in_wrap = 1; upe((void *)u->o, (void *)g_fn_setfg, P); g_in_wrap = 0;
         if (!dark) { g_ufg[i] = g_ufg[--g_nufg]; i--; }
     }
     { static int lg; if (dark && g_nufg && lg < 3) { lg++; logf_("theme: %d menus had a navy foreground -> white", (int)g_nufg); } }
@@ -402,6 +406,16 @@ static void slate_navy_restore(void) {
 static int tag_shown(uintptr_t o) {                                 /* a coloured name tag is on this text right now */
     for (int i = 0; i < g_ntw; i++) if (g_tw[i].obj == o) return g_tw[i].mode != 0;
     return 0;
+}
+/* widgets the add-on built itself and colours itself (the Goal Effects row): the theme keeps its hands off them */
+static uintptr_t g_th_skip[48]; static volatile LONG g_th_nskip;
+static int th_skip(uintptr_t o) { int n = g_th_nskip > 48 ? 48 : g_th_nskip; for (int i = 0; i < n; i++) if (g_th_skip[i] == o) return 1; return 0; }
+static void theme_leave_alone(uintptr_t o) {
+    if (!o) return;
+    if (!th_skip(o)) { g_th_skip[(g_th_nskip) % 48] = o; g_th_nskip++; }
+    EnterCriticalSection(&g_thcs);
+    for (int i = 0; i < g_nlive; i++) if (g_live[i].obj == o) g_live[i].applied = 3;
+    LeaveCriticalSection(&g_thcs);
 }
 static int live_apply(LiveW *w, int dark) {                        /* game thread; 1 = changed something */
     SetterRT *s = &g_set[w->si]; static uint8_t cur[2048];
@@ -420,7 +434,7 @@ static int live_apply(LiveW *w, int dark) {                        /* game threa
         g_tint_delta = 0; }
     else { DualCtx d = { dark, (uintptr_t)cur, (uintptr_t)w->orig }; copy_cb(&d, (uintptr_t)cur, kind | (s->size >= 32 ? 0x100 : 0), 0); }
     if (!memcmp(before, cur, s->size)) return 0;                     /* nothing to change */
-    ch_pe_fn upe = (ch_pe_fn)(g_exe + 0x10f7ef0);
+    ch_pe_fn upe = (ch_pe_fn)(g_exe + RVA_PE);
     g_in_wrap = 1; upe((void *)w->obj, (void *)s->fn, cur); g_in_wrap = 0;
     return 1;
 }
@@ -443,7 +457,8 @@ static int rs_alive(RSwap *r) { uintptr_t it = obj_item_rd(r->idx), o = 0; int32
 static uint32_t crc32_(const uint8_t *p, size_t n, uint32_t c) { c = ~c; while (n--) { c ^= *p++; for (int k = 0; k < 8; k++) c = c & 1 ? (c >> 1) ^ 0xEDB88320u : c >> 1; } return ~c; }
 static void be32(uint8_t *p, uint32_t v) { p[0] = v >> 24; p[1] = v >> 16; p[2] = v >> 8; p[3] = v; }
 static int make_png(const uint8_t *rgba, int W, int H, uint8_t *out) {          /* stored (uncompressed) PNG */
-    static uint8_t raw[160 * (1 + 160 * 4)]; int rn = 0; uint8_t *o = out;
+    static uint8_t raw[256 * (1 + 256 * 4) + 64]; int rn = 0; uint8_t *o = out;
+    if (W <= 0 || H <= 0 || (size_t)H * (1 + (size_t)W * 4) > sizeof raw) return 0;      /* never write past the work buffer */
     for (int y = 0; y < H; y++) { raw[rn++] = 0; memcpy(raw + rn, rgba + y * W * 4, W * 4); rn += W * 4; }
     static const uint8_t sig[8] = {137, 80, 78, 71, 13, 10, 26, 10}; memcpy(o, sig, 8); o += 8;
     be32(o, 13); memcpy(o + 4, "IHDR", 4); be32(o + 8, W); be32(o + 12, H); o[16] = 8; o[17] = 6; o[18] = o[19] = o[20] = 0;
@@ -514,7 +529,7 @@ static uintptr_t make_tex(void *ctxobj, int full) {           /* 0 white box, 1 
     uint8_t P[256]; memset(P, 0, sizeof P);
     *(uintptr_t *)(P + ow) = (uintptr_t)ctxobj;
     struct { void *data; int32_t num, max; } arr = { png, n, n }; memcpy(P + ob, &arr, 16);
-    ch_pe_fn upe = (ch_pe_fn)(g_exe + 0x10f7ef0);
+    ch_pe_fn upe = (ch_pe_fn)(g_exe + RVA_PE);
     upe((void *)g_krl_cdo, (void *)g_fn_import, P);
     uintptr_t t = *(uintptr_t *)(P + orr);
     if (t) { int32_t idx = -1; rd(t + 0x0C, &idx, 4); uintptr_t it = obj_item_rd(idx); int32_t fl = 0; if (it && rd(it + 8, &fl, 4)) { fl |= 0x40000000; wr_(it + 8, &fl, 4); } }   /* keep it (root set) */
@@ -536,7 +551,7 @@ static uintptr_t g_wbl_cdo, g_gs_cdo, g_wll_cdo, g_cls_uw, g_cls_img, g_cls_wtre
 static int fp(int f, const char *p) { int32_t o = -1; if (!FNS[f].fn || !prop_off(find_prop(FNS[f].fn, p), &o)) return -1; return o; }
 static int fpsz(int f, const char *p) { uintptr_t pr = FNS[f].fn ? find_prop(FNS[f].fn, p) : 0; int32_t z = 0; if (pr) rd(pr + 0x3C, &z, 4); return z; }
 static int fset(uint8_t *P, int f, const char *p, const void *v, int n) { int o = fp(f, p); if (o < 0 || o + n > 1024) return 0; memcpy(P + o, v, n); return 1; }
-static void fcall(uintptr_t obj, int f, uint8_t *P) { ch_pe_fn upe = (ch_pe_fn)(g_exe + 0x10f7ef0); upe((void *)obj, (void *)FNS[f].fn, P); }
+static void fcall(uintptr_t obj, int f, uint8_t *P) { ch_pe_fn upe = (ch_pe_fn)(g_exe + RVA_PE); upe((void *)obj, (void *)FNS[f].fn, P); }
 static int fns_ok(int a, int b) { for (int i = a; i <= b; i++) if (!FNS[i].fn) return 0; return 1; }
 typedef struct { void *data; int32_t num, max; } UStr;
 static UStr ustr(const wchar_t *w) { UStr u = { (void *)w, (int32_t)wcslen(w) + 1, (int32_t)wcslen(w) + 1 }; return u; }
@@ -679,8 +694,8 @@ static void rs_pump(void *self) {                                   /* game thre
     int want = g_dark;
     if (want && (!g_tex[0] || !g_tex[1] || !g_tex[2] || !g_tex[3] || !g_tex[4] || !g_tex[5])) {
         if (g_tex_fail > 3 || !g_krl_cdo || !g_fn_import || !self) return;
-        for (int k = 0; k < 6; k++) if (!g_tex[k]) g_tex[k] = make_tex(self, k);
-        if (!g_tex[0] || !g_tex[1] || !g_tex[2] || !g_tex[3] || !g_tex[4] || !g_tex[5]) { g_tex_fail++; return; }
+        for (int k = 0; k < 6; k++) if (!g_tex[k]) { g_tex[k] = make_tex(self, k); if (!g_tex[k]) g_tex_fail++; break; }      /* one picture per look: six at once was a 30 ms step */
+        if (!g_tex[0] || !g_tex[1] || !g_tex[2] || !g_tex[3] || !g_tex[4] || !g_tex[5]) return;
     }
     static uint8_t zero[16]; int budget = 2;                          /* at most 2 new icons per frame */
     EnterCriticalSection(&g_thcs);
@@ -717,7 +732,7 @@ static NHook g_nh[] = {
     { "Button", "SetStyle", NM_STYLE } };
 #define NNH ((int)(sizeof g_nh / sizeof g_nh[0]))
 static int g_nnh;
-typedef struct { uintptr_t o; int32_t idx; uint8_t si, navy, used, score; float game[4], ours[4]; } GCol;
+typedef struct { uintptr_t o; int32_t idx; uint8_t si, navy, used, score, bright; float game[4], ours[4], tint[4]; } GCol;
 #define GCN 16384
 static GCol *g_gcol;
 static GCol *gcol_get(uintptr_t o, int si, int make) {
@@ -746,13 +761,13 @@ static void nh_apply(int i, uintptr_t o, const float *nc) {
     uintptr_t fn = g_nh[i].fn;
     if (g_nh[i].mode == NM_TINT) { fn = FNS[F_TINT].fn; if (!fn || !rd(a, P, 0x28)) return; memcpy(P, nc, 16); P[16] = 0; }
     else { int sz = sc ? 0x28 : 16; if (!rd(a, P, sz)) return; memcpy(P, nc, 16); if (sc) P[16] = 0; }
-    g_in_wrap = 1; ch_pe_fn upe = (ch_pe_fn)(g_exe + 0x10f7ef0); upe((void *)o, (void *)fn, P); g_in_wrap = 0;
+    g_in_wrap = 1; ch_pe_fn upe = (ch_pe_fn)(g_exe + RVA_PE); upe((void *)o, (void *)fn, P); g_in_wrap = 0;
 }
 static void nh_set(uintptr_t o, int si, const float *nc) {           /* Sun restore through the plain setter */
     SetterRT *S = &g_set[si]; uint8_t P[0x80]; memset(P, 0, sizeof P);
     if (S->size > 0x80 || !rd(o + S->off, P, S->size)) return;
     memcpy(P, nc, 16); if (S->size >= 32) P[16] = 0;
-    g_in_wrap = 1; ch_pe_fn upe = (ch_pe_fn)(g_exe + 0x10f7ef0); upe((void *)o, (void *)S->fn, P); g_in_wrap = 0;
+    g_in_wrap = 1; ch_pe_fn upe = (ch_pe_fn)(g_exe + RVA_PE); upe((void *)o, (void *)S->fn, P); g_in_wrap = 0;
 }
 
 /* buttons whose blueprint swaps the whole style on hover (Settings "Apply Display Mode"): the new style is darkened in place */
@@ -785,6 +800,23 @@ static void style_redark_all(void) {                                  /* Moon ag
     int si = si_of("Button", "WidgetStyle");
     for (int i = 0; i < g_nsbtn; i++) { StBtn *b = &g_sbtn[i]; if (b->o && sbtn_alive(b)) style_dark(b->o, si); }
 }
+/* A highlight box (a settings row's background under the mouse) is a plain box the game colours navy. In Moon that navy
+ * becomes white - but the box's own picture tint was darkened with every other background, and white x dark = dark.
+ * While the box is the highlight its tint is made bright; when the game takes the highlight away the tint goes back. */
+static void img_hover_bright(uintptr_t o, GCol *g, int on) {
+    int si = img_brush_si(); if (!g || si < 0) return;
+    SetterRT *S = &g_set[si]; if (!S->fn || S->off < 0 || S->size <= 0 || S->size > 1900 || g_tint_off + 16 > S->size) return;
+    if (on ? g->bright : !g->bright) return;
+    static uint8_t b[2048]; if (!rd(o + S->off, b, S->size)) return; memset(b + S->size, 0, 64);
+    float *t = (float *)(b + g_tint_off);
+    if (on) { int dim = fmaxf(t[0], fmaxf(t[1], t[2])) < 0.5f;
+        static int lg; if (lg++ < 6) { char nm[48] = "", rn[48] = "-"; obj_name(o, nm, sizeof nm); uintptr_t res = img_res(o); if (res) obj_name(res, rn, sizeof rn);
+            logf_("theme: highlight box '%s' (picture %s): its own tint is %.2f %.2f %.2f %.2f - %s", nm, rn, t[0], t[1], t[2], t[3], dim ? "made bright while it is the highlight" : "bright already, left as it is"); }
+        if (!dim) return;
+        memcpy(g->tint, t, 16); t[0] = t[1] = t[2] = 1.0f; g->bright = 1; }
+    else { g->bright = 0; if (t[0] != 1.0f || t[1] != 1.0f || t[2] != 1.0f) return; memcpy(t, g->tint, 16); }
+    ch_pe_fn upe = (ch_pe_fn)(g_exe + RVA_PE); int w = g_in_wrap; g_in_wrap = 1; upe((void *)o, (void *)S->fn, b); g_in_wrap = w;
+}
 static void nh_before(int i, void *ctx, float *pre) {
     uintptr_t a; int sc; pre[0] = pre[1] = pre[2] = pre[3] = -1;
     if (g_dark && !g_in_wrap && !g_shutdown && ctx && nh_prop(i, (uintptr_t)ctx, &a, &sc)) memcpy(pre, (void *)a, 16);
@@ -815,12 +847,14 @@ static void nh_after(int i, void *ctx, const float *pre) {          /* game thre
     }
     if (g) { g->navy = (uint8_t)navy; memcpy(g->game, col, 16); memcpy(g->ours, ch ? nc : col, 16); }
     if (ch) nh_apply(i, o, nc);
+    if (g && !strcmp(g_nh[i].cls, "Image") && !strcmp(g_nh[i].fname, "SetColorAndOpacity")) img_hover_bright(o, g, ch && is_navy(col) && is_ourwhite(nc) && col[3] > 0.5f);
     { static int hl = 120; if (hl < 120) { char oc[64] = "", nm[48] = ""; uintptr_t ow = o, nx = 0;
         for (int d = 0; d < 6 && rdp(ow + 0x20, &nx) && nx; d++) { ow = nx; char cn2[64]; if (obj_name(obj_class(ow), cn2, sizeof cn2) && strcmp(cn2, "WidgetTree")) { snprintf(oc, sizeof oc, "%s", cn2); break; } }
         if (!strcmp(oc, "SettingsListItem_C") || !strcmp(oc, "Settings_C")) { hl++; obj_name(o, nm, sizeof nm);
             logf_("theme: game set %s.%s '%s' %.2f,%.2f,%.2f,%.2f -> %s", g_nh[i].cls, g_nh[i].fname, nm, col[0], col[1], col[2], col[3], ch ? "changed" : "kept"); } } }
 }
-#define NWRAP(i) static void nwrap##i(void *c, void *st, void *r) { float pre[4]; nh_before(i, c, pre); g_nh[i].orig(c, st, r); nh_after(i, c, pre); }
+static LONGLONG g_tc_hook; static int g_tc_calls; static LONGLONG tc_now(void);
+#define NWRAP(i) static void nwrap##i(void *c, void *st, void *r) { if (!g_dark) { g_nh[i].orig(c, st, r); return; } float pre[4]; nh_before(i, c, pre); g_nh[i].orig(c, st, r); LONGLONG t0 = tc_now(); nh_after(i, c, pre); g_tc_hook += tc_now() - t0; g_tc_calls++; }
 NWRAP(0) NWRAP(1) NWRAP(2) NWRAP(3) NWRAP(4) NWRAP(5) NWRAP(6) NWRAP(7) NWRAP(8)
 static FNat NWRAPS[9] = { nwrap0, nwrap1, nwrap2, nwrap3, nwrap4, nwrap5, nwrap6, nwrap7, nwrap8 };
 static void nh_install(void) {
@@ -866,10 +900,22 @@ static void nh_restore_all(void) {                                    /* Sun: gi
 static int32_t o_w_vis;
 static DWORD g_th_last;
 static void theme_pump_(void *self);
-static void theme_pump(void *self) { if (!g_shutdown) theme_pump_(self); }
+static LARGE_INTEGER g_tc_f; static LONGLONG g_tc_pump, g_tc_max; static DWORD g_tc_t;
+static LONGLONG tc_now(void) { LARGE_INTEGER t; QueryPerformanceCounter(&t); return t.QuadPart; }
+static void tc_report(void) {                                       /* how much game-thread time dark mode used, every 10 s while it is noticeable */
+    DWORD now = GetTickCount(); if (!g_tc_t) { g_tc_t = now; QueryPerformanceFrequency(&g_tc_f); return; }
+    if (now - g_tc_t < 10000) return;
+    double f = g_tc_f.QuadPart ? 1000.0 / (double)g_tc_f.QuadPart : 0, secs = (now - g_tc_t) / 1000.0;
+    double pm = g_tc_pump * f / secs, hm = g_tc_hook * f / secs, mx = g_tc_max * f;
+    static int lg; if (g_dark && lg < 60 && (pm + hm > 1.5 || mx > 4.0)) { lg++; logf_("theme: dark mode used %.2f ms of each second (checks %.2f, the game's own colour changes %.2f in %d calls); longest single step %.1f ms; %ld widgets tracked", pm + hm, pm, hm, (int)(g_tc_calls / secs), mx, g_nlive); }
+    g_tc_pump = g_tc_hook = g_tc_max = 0; g_tc_calls = 0; g_tc_t = now;
+}
+static void theme_pump(void *self) { if (g_shutdown) return; LONGLONG t0 = tc_now(); theme_pump_(self); LONGLONG d = tc_now() - t0; g_tc_pump += d; if (d > g_tc_max) g_tc_max = d; tc_report(); }
 static void theme_pump_(void *self) {                                     /* game thread, from the widget-event hook */
     DWORD now = GetTickCount();
     int want = g_dark ? 1 : 0, toggled = want != g_pump_dark;
+    static int ever_dark; if (want) ever_dark = 1;
+    if (!want && !toggled && !ever_dark) return;                     /* Sun and never switched to Moon: nothing was changed, nothing to do */
     if (!toggled && now - g_th_last < 100) return;
     g_th_last = now;
     if (toggled) {                                                  /* switch clicked: everything in this one frame */
@@ -950,7 +996,7 @@ static void theme_pump_(void *self) {                                     /* gam
                 float c3[4], n3[4]; if (!rd(o3 + g_set[w->si].off, c3, 16) || !col_new(w->kind, c3, n3)) continue;
                 uint8_t P3[0x40]; memset(P3, 0, sizeof P3); if (g_set[w->si].size > 0x40 || !rd(o3 + g_set[w->si].off, P3, g_set[w->si].size)) continue;
                 memcpy(P3, n3, 16); if (g_set[w->si].size >= 32) P3[16] = 0;
-                ch_pe_fn upe3 = (ch_pe_fn)(g_exe + 0x10f7ef0); g_in_wrap = 1; upe3((void *)o3, (void *)g_set[w->si].fn, P3); g_in_wrap = 0;
+                ch_pe_fn upe3 = (ch_pe_fn)(g_exe + RVA_PE); g_in_wrap = 1; upe3((void *)o3, (void *)g_set[w->si].fn, P3); g_in_wrap = 0;
                 w->applied = 1; continue;
             }
             if (w->si != (uint8_t)tsi) {                                 /* tinted icons and sliders: navy left on screen -> white */
@@ -961,7 +1007,7 @@ static void theme_pump_(void *self) {                                     /* gam
                 float n2[4] = { 0.92f, 0.92f, 0.92f, c2[3] }; uint8_t P2[0x40]; memset(P2, 0, sizeof P2);
                 if (g_set[w->si].size > 0x40 || !rd(o2 + g_set[w->si].off, P2, g_set[w->si].size)) continue;
                 memcpy(w->orig, c2, 16); memcpy(P2, n2, 16); if (g_set[w->si].size >= 32) P2[16] = 0;
-                ch_pe_fn upe2 = (ch_pe_fn)(g_exe + 0x10f7ef0); g_in_wrap = 1; upe2((void *)o2, (void *)g_set[w->si].fn, P2); g_in_wrap = 0;
+                ch_pe_fn upe2 = (ch_pe_fn)(g_exe + RVA_PE); g_in_wrap = 1; upe2((void *)o2, (void *)g_set[w->si].fn, P2); g_in_wrap = 0;
                 w->applied = 1; continue;
             }
 
@@ -979,7 +1025,7 @@ static void theme_pump_(void *self) {                                     /* gam
             if (g_set[tsi].size > 0x40 || !rd(o + g_set[tsi].off, P, g_set[tsi].size)) continue;
             memcpy(w->orig, col, 16); w->orig[16] = 0;                  /* Sun puts the game's colour back */
             memcpy(P, nc, 16); P[16] = 0;
-            ch_pe_fn upe = (ch_pe_fn)(g_exe + 0x10f7ef0); g_in_wrap = 1; upe((void *)o, (void *)g_set[tsi].fn, P); g_in_wrap = 0;
+            ch_pe_fn upe = (ch_pe_fn)(g_exe + RVA_PE); g_in_wrap = 1; upe((void *)o, (void *)g_set[tsi].fn, P); g_in_wrap = 0;
             w->applied = 1;
         }
     }
@@ -1013,8 +1059,20 @@ static int class_kind_for(const char *nm) {
     if (ci_has(nm, "CheckBox") || ci_has(nm, "ScrollBar") || ci_has(nm, "ScrollBox") || ci_has(nm, "Slider") || ci_has(nm, "Progress") || ci_has(nm, "SpinBox") || ci_has(nm, "Throbber")) return CK_ACCENT;
     return CK_BG;
 }
-static void templates_set(int dark) {                             /* background thread: template memory */
-    for (int i = 0; i < g_ntpl; i++) col_write(g_tpl[i].addr, g_tpl[i].is_fcolor, dark ? g_tpl[i].dark : g_tpl[i].orig);
+static int patch_alive(const Patch *p) {                          /* the blueprint copy this colour sits in still exists, and the address is inside it */
+    uintptr_t it = obj_item_rd(p->oidx), o = 0; int32_t ser = 0, fl = 0;
+    return p->own && p->addr > p->own && p->addr - p->own < 0x8000 && it && rdp(it, &o) && o == p->own && rd(it + 8, &fl, 4) && !(fl & 0x30000000) && rd(it + 0x10, &ser, 4) && ser == p->oser;
+}
+static void templates_set(int dark) {                             /* template memory; colours of copies the game has thrown away are forgotten, never written */
+    int j = 0, gone = 0;
+    for (int i = 0; i < g_ntpl; i++) {
+        Patch *p = &g_tpl[i];
+        if (!patch_alive(p)) { gone++; continue; }
+        float c[4]; if (col_read(p->addr, 0, p->is_fcolor, c) && (p->is_fcolor || col_eq(c, p->orig) || col_eq(c, p->dark))) col_write(p->addr, p->is_fcolor, dark ? p->dark : p->orig);
+        if (j != i) g_tpl[j] = *p; j++;
+    }
+    g_ntpl = j;
+    if (gone) { static int lg; if (lg++ < 20) logf_("theme: %d saved colours belonged to menus the game has removed: forgotten", gone); }
 }
 /* ---- is the main menu's Exit button on screen? (the switch hides while a sub-menu covers it) */
 static int32_t o_w_vis = -1, o_w_slot = -1, o_ps_parent = -1, o_sw_active = -1, o_pw_slots = -1, o_tb_text = -1;
@@ -1196,7 +1254,7 @@ static void dump_bytext(uintptr_t o, uintptr_t cls) {               /* texts tha
     if (cls != lcls) { lcls = cls; toff = -1; uintptr_t tp = find_prop(cls, "Text"); char tn[64]; if (tp && fld_type(tp, tn, sizeof tn) && !strcmp(tn, "TextProperty")) prop_off(tp, &toff); }
     if (toff < 0) return;
     uintptr_t td = 0; wchar_t w[40]; if (!rdp(o + toff, &td) || !td || !text_of(td, w, 36)) return;
-    if (_wcsicmp(w, L"PlayerName")) return;                     /* debug: put a player name here */
+    if (_wcsicmp(w, L"Na (Virginia)")) return;
     char nm[64] = "", cn[64] = "", oc[96] = ""; obj_name(o, nm, sizeof nm); obj_name(cls, cn, sizeof cn); owner_name(o, oc, sizeof oc);
     uint64_t h = 1469598103934665603ull; for (const char *q = nm; *q; q++) h = (h ^ (unsigned char)*q) * 1099511628211ull; for (const char *q = oc; *q; q++) h = (h ^ (unsigned char)*q) * 1099511628211ull;
     int slot = -1; for (int k = 0; k < ns; k++) if (seen[k] == h) slot = k;
@@ -1270,7 +1328,7 @@ static void rest_cb(void *ctx, uintptr_t a, int kind, int fc) {
 static int th_scan_cb(uintptr_t o, uintptr_t cls, void *ctx) {
     ThScan *s = (ThScan *)ctx; char nm[96];
     if (cls == g_cls_world) { if (obj_name(o, nm, sizeof nm)) { if (!strcmp(nm, "MainMenu")) s->worlds_menu++; else if (!strncmp(nm, "MP_", 3)) s->worlds_match++; } return 0; }
-    if (cls == g_cls_gi && o_gi_userid >= 0 && !is_cdo(o)) { char id[64]; if (get_fstring(o, o_gi_userid, id, sizeof id) && id[0]) s->logged = 1; return 0; }
+    if (cls == g_cls_gi && o_gi_userid >= 0 && !is_cdo(o)) { char id[64]; g_gi_obj = o; if (get_fstring(o, o_gi_userid, id, sizeof id) && id[0]) s->logged = 1; return 0; }
     int k = widget_kind(cls);
     if (k < 0) return 0;
     uint32_t fl = 0; rd(o + 8, &fl, 4);
@@ -1281,6 +1339,7 @@ static int th_scan_cb(uintptr_t o, uintptr_t cls, void *ctx) {
             && obj_name(obj_class(ow2), cn, sizeof cn) && (!strcmp(cn, "WidgetBlueprintGeneratedClass") || !strcmp(cn, "Class"))) is_tpl = 1;
     }
     if (is_tpl) {
+        { int32_t ix = -1, sr = 0; rd(o + 0x0C, &ix, 4); uintptr_t itx = obj_item_rd(ix); if (itx) rd(itx + 0x10, &sr, 4); g_tplown = o; g_tplown_idx = ix; g_tplown_ser = sr; }
         if (k < (int)NSET) {                                         /* blueprint copies of texts/sliders/icons: new widgets are born themed */
             const char *c = SETTERS[k].cls; int a1 = -1, a2 = -1, kk = 0;
             if ((!strcmp(c, "Border") || !strcmp(c, "Button") || !strcmp(c, "Image")) && !seen_tpl(o ^ 0x77)) {   /* backgrounds, buttons, pictures */
@@ -1410,7 +1469,7 @@ static int th_scan_cb(uintptr_t o, uintptr_t cls, void *ctx) {
         else { float c[4], n[4]; memcpy(c, orig, 16); changes = !(g_set[si].size >= 32 && orig[16]) && col_new(okind, c, n); }
         if (!changes && strcmp(SETTERS[si].cls, "TextBlock")) { free(orig); continue; }
         EnterCriticalSection(&g_thcs);
-        LiveW *w = &g_live[g_nlive]; w->obj = o; w->idx = idx; w->serial = ser; w->si = (uint8_t)si; w->applied = 0; w->tag = 0; w->kind = (uint8_t)(okind != SETTERS[si].kind ? okind : 0); w->orig = orig; g_nlive++;
+        LiveW *w = &g_live[g_nlive]; w->obj = o; w->idx = idx; w->serial = ser; w->si = (uint8_t)si; w->applied = th_skip(o) ? 3 : 0; w->tag = 0; w->kind = (uint8_t)(okind != SETTERS[si].kind ? okind : 0); w->orig = orig; g_nlive++;
         LeaveCriticalSection(&g_thcs);
     }
     return 0;
@@ -1595,7 +1654,7 @@ static void pos_query(void) {                                       /* game thre
     if (!it || !rdp(it, &chk) || chk != t || !rd(it + 0x10, &ser, 4) || ser != g_exit_ser) return;
     uintptr_t o = t, slot = 0, par = 0;                              /* the Exit button around the text */
     if (rdp(t + o_w_slot, &slot) && slot && rdp(slot + o_ps_parent, &par) && par) o = par;
-    ch_pe_fn upe = (ch_pe_fn)(g_exe + 0x10f7ef0);
+    ch_pe_fn upe = (ch_pe_fn)(g_exe + RVA_PE);
     static uint8_t P[512], Q[512]; uint8_t geo[200];
     memset(P, 0, sizeof P); upe((void *)o, (void *)g_fn_cgeo, P); memcpy(geo, P + r_geo, gsz);
     memset(Q, 0, sizeof Q); memcpy(Q + l_geo, geo, gsz); upe((void *)g_sbl_cdo, (void *)g_fn_lsize, Q);
@@ -1624,11 +1683,11 @@ static void obj_id(uintptr_t o, int32_t *idx, int32_t *ser) { *idx = -1; *ser = 
 static uintptr_t png_texture(void *ctx, const uint8_t *rgba, int W, int H) {
     static uint8_t png[400 * 200 * 4 + 400 + 4096];
     if (W * H > 400 * 200) return 0;
-    int n = make_png(rgba, W, H, png);
+    int n = make_png(rgba, W, H, png); if (n <= 0) return 0;
     int ow = -1, ob = -1, orr = -1; if (!prop_off(find_prop(g_fn_import, "WorldContextObject"), &ow) || !prop_off(find_prop(g_fn_import, "Buffer"), &ob) || !prop_off(find_prop(g_fn_import, "ReturnValue"), &orr)) return 0;
     uint8_t P[256]; memset(P, 0, sizeof P); *(uintptr_t *)(P + ow) = (uintptr_t)ctx;
     struct { void *data; int32_t num, max; } arr = { png, n, n }; memcpy(P + ob, &arr, 16);
-    ch_pe_fn upe = (ch_pe_fn)(g_exe + 0x10f7ef0); upe((void *)g_krl_cdo, (void *)g_fn_import, P);
+    ch_pe_fn upe = (ch_pe_fn)(g_exe + RVA_PE); upe((void *)g_krl_cdo, (void *)g_fn_import, P);
     uintptr_t t = *(uintptr_t *)(P + orr);
     if (t) { int32_t idx = -1; rd(t + 0x0C, &idx, 4); uintptr_t it = obj_item_rd(idx); int32_t fl = 0; if (it && rd(it + 8, &fl, 4)) { fl |= 0x40000000; wr_(it + 8, &fl, 4); } }
     return t;
@@ -1702,9 +1761,10 @@ static void ig_update(void) {                                           /* game 
     if (!g_ig_ok) { g_ig_ok = 1; logf_("theme: switch is drawn in the game (%.0fx%.0f, scale %.2f)", W, H, sc); }
 }
 static LRESULT CALLBACK game_wp(HWND h, UINT m, WPARAM w, LPARAM l) {
+    g_hb_tick = GetTickCount();
     if (m == WM_CLOSE || m == WM_DESTROY || m == WM_QUIT || m == WM_ENDSESSION) g_shutdown = 1;     /* game closing: hands off */
     if (m == WM_THEME_NOW) { uintptr_t ctxo = g_exit_obj; if (ctxo && !obj_alive3(ctxo, g_exit_idx, g_exit_ser)) ctxo = 0; theme_pump((void *)ctxo); return 0; }      /* game thread: whole switch now */
-    if (m == WM_THEME_TICK) { uintptr_t ctxo = g_exit_obj; if (ctxo && !obj_alive3(ctxo, g_exit_idx, g_exit_ser)) ctxo = 0; theme_pump((void *)ctxo); g_tick_pending = 0; return 0; }
+    if (m == WM_THEME_TICK) { uintptr_t ctxo = g_exit_obj; if (ctxo && !obj_alive3(ctxo, g_exit_idx, g_exit_ser)) ctxo = 0; g_bc = 21; theme_pump((void *)ctxo); g_bc = 22; goaltab_tick((void *)ctxo); g_bc = 23; goalvid_tick(); g_bc = 0; g_tick_pending = 0; return 0; }
     if (m == WM_THEME_POS) { if (g_sw_cand) pos_query(); ig_update(); g_pos_pending = 0; return 0; }
     return CallWindowProcW(g_game_wp, h, m, w, l);
 }
@@ -1813,7 +1873,10 @@ static DWORD WINAPI theme_worker(LPVOID u) {
             LeaveCriticalSection(&g_thcs);
         }
         if ((s.new_tpl || logs < 3) && logs < 12) { logs++; logf_("theme: %d template colours, %ld live widgets", g_ntpl, g_nlive); }
-        Sleep(g_exit_obj && GetTickCount() - g_world_tick > 4000 ? 450 : 100);   /* menus are rebuilt right after a level change */
+        {   /* menus are rebuilt right after a level change: look often then, much less once things settle (and least in a match) */
+            int settled = GetTickCount() - g_world_tick > 4000;
+            Sleep(!settled ? 150 : s.worlds_match > 0 ? 2500 : 700);
+        }
     }
 }
 static void theme_start(void) {

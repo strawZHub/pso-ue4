@@ -1,3 +1,4 @@
+# never upload: game files, builds, server and private stuff
 *.pak
 *.exe
 *.dll
@@ -5,6 +6,7 @@
 *.db
 *.sqlite*
 *.log
+*.py.bak
 *.bak
 *.pem
 *.key

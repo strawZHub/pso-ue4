@@ -1,0 +1,51 @@
+# Verify the downloads match this source
+
+You don't have to trust anyone blindly. Each release lists the SHA-256 of its files.
+
+## Check a file you were given (no coding needed)
+
+Windows, in a terminal, in the folder with the file:
+
+```
+certutil -hashfile PSOLauncher.exe SHA256
+certutil -hashfile xinput1_3.dll SHA256
+```
+
+If the hash matches the one listed here (and on the release), your file is exactly the published one.
+
+## Launcher - build 25 (current)
+
+```
+SHA256:  c9777ab5e964871fe5511a0b2ffb9c94c8081c29e413470a66e0a908c9f5c4e1
+file:    PSOLauncher.exe  (1,368,064 bytes)
+built from: launcher/ at this commit + the launcher's pictures (art.h, app.ico)
+compiler: ziglang 0.17.1
+```
+
+The launcher's pictures (the big header image, background, logo and icon) are not in this repository, so a
+rebuild from this source with your own pictures will differ from the release only in those embedded pictures.
+Everything the launcher *does* is the code in `launcher/`.
+
+## Add-on (xinput1_3.dll)
+
+The add-on build is **reproducible**: compile `addon/` with the exact compiler and you get a byte-for-byte
+identical file.
+
+1. Install the exact compiler:  `pip install ziglang==0.17.1`
+2. From the repo root, run `build-addon.bat`  (or the one command inside it).
+3. Compare the printed SHA256 to the add-on hash of the matching release.
+
+The code in `addon/` at this commit builds to:
+
+```
+SHA256:  b6202fd850ff0d92b978e59f04bb72c032375c2a5c2e46d0a52d5f67527c1b4f
+file:    xinput1_3.dll
+```
+
+Note: the add-on code in `addon/` is from an earlier release; an update matching the add-on players run today
+is coming in a later commit. Until then, the hash of the current add-on will not match a build of this folder.
+
+## What's not here
+
+The match-server build of the add-on (run on the community's servers, not by players) is a separate, larger
+binary and is not in this repo. See the README for the full list of what the add-on and launcher do.
