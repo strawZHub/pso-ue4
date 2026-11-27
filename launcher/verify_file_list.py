@@ -1,17 +1,18 @@
 """Check the launcher's file list yourself (no extra packages, Python 3.8+).
 
-    python verify_file_list.py                 -> is the server's file list signed with the owner's key?
+    python verify_file_list.py                 -> is the server's file list approved (signed) by the reviewer, Vxie?
     python verify_file_list.py "<game folder>"  -> ...and does every file in that folder match it (SHA-256)?
 
-This is the same check launcher build 26 makes before it downloads anything: the text below
+This is the same check launcher build 28 makes before it downloads anything: the text below
 ("PSO-FILES-1", then every file as path<TAB>size<TAB>sha256, sorted, then the launcher the server hands out)
-must carry an ECDSA P-256 signature made with the owner's private key. The public key is FILES_PUB in
-psolauncher.c and below.
+must carry an ECDSA P-256 signature made with the reviewer's (Vxie's) private key. The public key is FILES_PUB in
+psolauncher.c and below (since launcher build 28; builds 26/27 used the server owner's key).
 """
 import hashlib, json, os, ssl, sys, urllib.request
 
 SERVER = "play.pso-ue4.com"
-FILES_PUB = "05a82c0ae69e0a1ef691234ccd3069454327cd2844d405ba8a34e925f172e9174e27c188d95e48f007531b11cee723ae2bc5c75833fc68cee2340ad2d652ee3f"
+# build 28+: the independent reviewer's key (Vxie, fingerprint EC18 3E77 6C38 2447) - the only key the launcher trusts
+FILES_PUB = "26e9eaeccdea68d9fb4c11019308193da0c33c180d46b634a40a024c962772ea895a4c7535da4b593d2ab4ea97050ed15cbb04ff763af4785089487002a5dee9"
 
 P = 0xffffffff00000001000000000000000000000000ffffffffffffffffffffffff
 N = 0xffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551
@@ -54,8 +55,8 @@ def main():
     text = "PSO-FILES-1\n" + "".join(f"{f['p']}\t{f['s']}\t{f['h2']}\n" for f in files)
     if man.get("self"):
         text += f"@launcher\t{man['self']['s']}\t{man['self']['h2']}\n"
-    ok = bool(man.get("sig")) and ecdsa_ok(FILES_PUB, text.encode(), man["sig"])
-    print(f"version {man['version']}: {len(files)} files, signature {'VALID' if ok else 'MISSING OR INVALID'}")
+    ok = bool(man.get("sig2")) and ecdsa_ok(FILES_PUB, text.encode(), man["sig2"])   # "sig2" = the reviewer's approval
+    print(f"version {man['version']}: {len(files)} files, reviewer approval {'VALID' if ok else 'MISSING OR INVALID'}")
     if man.get("self"):
         print(f"launcher the server hands out: {man['self']['s']} bytes, SHA-256 {man['self']['h2']}")
     if len(sys.argv) > 1 and ok:

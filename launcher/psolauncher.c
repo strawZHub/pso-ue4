@@ -6,8 +6,12 @@
  * the file list must carry the owner's signature (ECDSA P-256, public key below) before anything is downloaded, every file is
  * checked with SHA-256, and a launcher update is only taken when its SHA-256 is in that signed list.
  * Build 27: "Ask before updating" (Settings): game and launcher updates wait for the player, who first sees which files
- * changed; the Steam label says what it is ("Your Steam account" - read from Steam on this PC, not a sign-in). */
-#define PSO_BUILD 27          /* launcher build number (the self-update compares it) */
+ * changed; the Steam label says what it is ("Your Steam account" - read from Steam on this PC, not a sign-in).
+ * Build 28: the ONLY key it trusts is the independent reviewer's (Vxie). The server owner can upload files but can't approve
+ * them: without the reviewer's signature ("sig2" in the file list) nothing is downloaded and no launcher update is taken.
+ * Settings show who approves and the key's fingerprint. A launcher update is checked for as soon as the signed list is in,
+ * and if an antivirus removes the new launcher right after the swap, the old one is put back so the player keeps a launcher. */
+#define PSO_BUILD 28          /* launcher build number (the self-update compares it) */
 #define UNICODE
 #define _UNICODE
 #include <windows.h>
@@ -28,8 +32,10 @@
 #include <shobjidl.h>
 
 #define DEFAULT_SERVER L"play.pso-ue4.com"       /* a name, so the server can move without a new launcher (and the certificate is for it) */
-/* the owner's file-list key (public half; the private half never leaves the owner's PC): X || Y of an ECDSA P-256 key */
-static const unsigned char FILES_PUB[64] = { 0x05, 0xa8, 0x2c, 0x0a, 0xe6, 0x9e, 0x0a, 0x1e, 0xf6, 0x91, 0x23, 0x4c, 0xcd, 0x30, 0x69, 0x45, 0x43, 0x27, 0xcd, 0x28, 0x44, 0xd4, 0x05, 0xba, 0x8a, 0x34, 0xe9, 0x25, 0xf1, 0x72, 0xe9, 0x17, 0x4e, 0x27, 0xc1, 0x88, 0xd9, 0x5e, 0x48, 0xf0, 0x07, 0x53, 0x1b, 0x11, 0xce, 0xe7, 0x23, 0xae, 0x2b, 0xc5, 0xc7, 0x58, 0x33, 0xfc, 0x68, 0xce, 0xe2, 0x34, 0x0a, 0xd2, 0xd6, 0x52, 0xee, 0x3f };
+/* the reviewer's file-list key (Vxie; public half - the private half never leaves his PC): X || Y of an ECDSA P-256 key.
+   build 26/27 had the server owner's key here; since build 28 the owner can't approve updates. */
+#define APPROVER_NAME L"Vxie"
+static const unsigned char FILES_PUB[64] = { 0x26, 0xe9, 0xea, 0xec, 0xcd, 0xea, 0x68, 0xd9, 0xfb, 0x4c, 0x11, 0x01, 0x93, 0x08, 0x19, 0x3d, 0xa0, 0xc3, 0x3c, 0x18, 0x0d, 0x46, 0xb6, 0x34, 0xa4, 0x0a, 0x02, 0x4c, 0x96, 0x27, 0x72, 0xea, 0x89, 0x5a, 0x4c, 0x75, 0x35, 0xda, 0x4b, 0x59, 0x3d, 0x2a, 0xb4, 0xea, 0x97, 0x05, 0x0e, 0xd1, 0x5c, 0xbb, 0x04, 0xff, 0x76, 0x3a, 0xf4, 0x78, 0x50, 0x89, 0x48, 0x70, 0x02, 0xa5, 0xde, 0xe9 };
 #define WM_REFRESH (WM_APP + 1)
 
 /* ------------------------------------------------------------ state shared with the UI */
@@ -177,7 +183,8 @@ static volatile LONG g_cdn_nofail;      /* Cloudflare connections that failed in
 static FileEnt *g_files; static int g_nfiles, g_version;
 static void llog(const char *fmt, ...);
 static volatile int g_signed;                    /* the file list now in g_files carries the owner's valid signature */
-static CRITICAL_SECTION g_selfcs; static LONGLONG g_self_s; static char g_self_h2[65];   /* the launcher the signed list names (0 = none) */
+static CRITICAL_SECTION g_selfcs; static LONGLONG g_self_s; static char g_self_h2[65];
+static HANDLE g_selfupd_evt;                     /* build 28: set when a signed list has come in */   /* the launcher the signed list names (0 = none) */
 
 typedef struct { char p[400]; LONGLONG s; LONGLONG mt; char h[65]; } CacheEnt;   /* h = SHA-256 */
 static CacheEnt *g_cache; static int g_ncache;
@@ -323,12 +330,13 @@ static int parse_manifest(const char *js) {
     const char *sf = strstr(js, "\"self\": {");
     if (sf) { double d; const char *q = strstr(sf, "\"h2\": \"");
         if (json_num(sf, "s", &d) && q && is_hex(q + 7, 64)) { ss = (LONGLONG)d; memcpy(sh, q + 7, 64); sh[64] = 0; } }
-    char sig[129] = ""; const char *sg = strstr(js, "\"sig\": \"");
-    if (sg && is_hex(sg + 8, 128) && sg[136] == '"') { memcpy(sig, sg + 8, 128); sig[128] = 0; }
+    char sig[129] = ""; const char *sg = strstr(js, "\"sig2\": \"");          /* build 28: the reviewer's signature */
+    if (sg && is_hex(sg + 9, 128) && sg[137] == '"') { memcpy(sig, sg + 9, 128); sig[128] = 0; }
     g_signed = sig[0] && verify_list(sig, ss, sh);
     EnterCriticalSection(&g_selfcs);
     if (g_signed) { g_self_s = ss; strcpy(g_self_h2, sh); }
     LeaveCriticalSection(&g_selfcs);
+    if (g_signed && g_selfupd_evt) SetEvent(g_selfupd_evt);     /* build 28: look for a launcher update now, not on the next timer */
     llog("file list version %d: %d files, signature %s", g_version, g_nfiles, g_signed ? "valid" : sig[0] ? "INVALID" : "missing");
     return 1;
 }
@@ -569,7 +577,7 @@ static int confirm_update(int cnt, LONGLONG need) {
         wchar_t w[400]; MultiByteToWideChar(CP_UTF8, 0, g_files[i].p, -1, w, 400);
         n += swprintf(m + n, cap - n, L"\x2022 %ls  (%.1f MB)\n", w, g_files[i].s / 1048576.0); shown++; }
     if (cnt > shown) n += swprintf(m + n, cap - n, L"\x2022 ... and %d more\n", cnt - shown);
-    swprintf(m + n, cap - n, L"\nThe list is signed by the server owner, and every file is checked (SHA-256) before it is used.\n"
+    swprintf(m + n, cap - n, L"\nThis update is approved (signed) by " APPROVER_NAME L", and every file is checked (SHA-256) before it is used.\n"
                              L"You can check the list yourself with verify_file_list.py (github.com/strawZHub/pso-ue4).\n\nInstall this update now?");
     g_ui_busy = 1;
     int a = MessageBoxW(g_wnd, m, L"PSO UE4 Launcher \x2022 update", MB_YESNO | MB_ICONQUESTION);
@@ -636,7 +644,7 @@ static DWORD WINAPI worker(LPVOID u) {
         set_status(ST_CHECKING, L"Checking game files...");
         LONGLONG need = check_files();
         if (need && !g_signed) {                 /* build 26: nothing is downloaded from a list the owner didn't sign */
-            set_status(ST_ERROR, L"This update isn't signed by the server owner yet, so it isn't downloaded (that keeps your PC safe). Trying again in a minute...");
+            set_status(ST_ERROR, L"This update isn't approved by " APPROVER_NAME L" yet, so it isn't downloaded (that keeps your PC safe). Trying again in a minute...");
             wait_click(60);
             continue;
         }
@@ -1474,7 +1482,9 @@ static void draw_settings(HDC m, void *G) {
         rr_fill(G, b.left, b.top, bw, bh, bh / 2, ARGB(have ? (hot ? 40 : 18) : 8, 255, 255, 255)); rr_line(G, b.left, b.top, bw, bh, bh / 2, ARGB(have ? (hot ? 100 : 54) : 24, 255, 255, 255));
         text_sp(m, f_lbl, have ? RGB(255, 255, 255) : C_LBL, b.left + S(1), b.top, bw, bh, L"OPEN", DT_CENTER | DT_VCENTER | DT_SINGLELINE, S(1));
         wchar_t foot[160]; int bn = PSO_BUILD;
-        swprintf(foot, 160, g_installed_once ? L"Launcher build %d" : L"Launcher build %d  \x2022  You can change the game folder on the main screen before installing.", bn);
+        static wchar_t fpw[24]; if (!fpw[0]) { unsigned char d[32]; char hx[65]; if (sha256_buf(FILES_PUB, 64, d)) { hex_of(d, 8, hx);
+            for (int i = 0, k = 0; i < 16; i++) { if (i && !(i % 4)) fpw[k++] = L' '; fpw[k++] = (wchar_t)toupper((unsigned char)hx[i]); fpw[k] = 0; } } }
+        swprintf(foot, 160, L"Launcher build %d  \x2022  Updates approved by " APPROVER_NAME L"  \x2022  key %ls", bn, fpw);
         text(m, f_small, C_LBL, x, s.bottom - S(34), sw - S(48), S(18), foot, DT_SINGLELINE | DT_END_ELLIPSIS); }
 }
 
@@ -2035,6 +2045,7 @@ static DWORD WINAPI selfupd_thread(LPVOID u) {
     DeleteFileW(nw);
     for (int round = 0;; round++) {
         for (int t = 0; !g_online && t < 600; t++) Sleep(200);
+        if (!g_self_s && g_selfupd_evt) WaitForSingleObject(g_selfupd_evt, 90000);   /* build 28: the moment the signed list is in */
         LONGLONG want_s; char want_h[65];
         EnterCriticalSection(&g_selfcs); want_s = g_self_s; strcpy(want_h, g_self_h2); LeaveCriticalSection(&g_selfcs);
         size_t n = 0; unsigned char *b = g_online && want_s > 0 ? http_get_bin(L"/download", &n) : NULL;
@@ -2048,7 +2059,7 @@ static DWORD WINAPI selfupd_thread(LPVOID u) {
         if (got > PSO_BUILD && g_ask_upd) {
             if (got <= declined) { free(b); for (int t = 0; t < 30 * 60; t++) Sleep(1000); continue; }
             for (int quiet = 0; quiet < 4; ) { quiet = su_quiet() ? quiet + 1 : 0; Sleep(250); }
-            wchar_t q[400]; swprintf(q, 400, L"Launcher build %d is available (you have build %d).\n\nIt is the exact file named in the server owner's signed list "
+            wchar_t q[400]; swprintf(q, 400, L"Launcher build %d is available (you have build %d).\n\nIt is the exact file named in the list " APPROVER_NAME L" approved "
                                              L"(SHA-256 checked). The launcher restarts after it is put in place.\n\nInstall it now?", got, PSO_BUILD);
             g_ui_busy = 1; int a = MessageBoxW(g_wnd, q, L"PSO UE4 Launcher \x2022 launcher update", MB_YESNO | MB_ICONQUESTION); g_ui_busy = 0;
             if (a != IDYES) { declined = got; free(b); continue; }
@@ -2067,6 +2078,16 @@ static DWORD WINAPI selfupd_thread(LPVOID u) {
                 }
                 DeleteFileW(nw);
             }
+            if (ok) {                                                    /* build 28: an antivirus may delete the new file at once */
+                Sleep(2500);
+                LONGLONG nsz, nmt;
+                if (!file_info(exe, &nsz, &nmt) || nsz != (LONGLONG)n) {
+                    MoveFileExW(old, exe, MOVEFILE_REPLACE_EXISTING);   /* the old launcher goes back in place */
+                    llog("launcher update: the new launcher was removed (antivirus?) - old one put back");
+                    set_status(-1, L"Your antivirus removed the new launcher, so this one stays. Nothing else changes.");
+                    g_updating = 0; PostMessage(g_wnd, WM_REFRESH, 3, 0); free(b); return 0;
+                }
+            }
             if (ok) {
                 set_status(-1, L"Launcher update found \x2022 build %d to build %d \x2022 restarting...", PSO_BUILD, got);
                 Sleep(1300);
@@ -2074,10 +2095,23 @@ static DWORD WINAPI selfupd_thread(LPVOID u) {
                 wcscpy(dir, exe); { wchar_t *sl = wcsrchr(dir, L'\\'); if (sl) *sl = 0; }
                 STARTUPINFOW si = { sizeof si }; PROCESS_INFORMATION pi;
                 if (CreateProcessW(exe, cmd, NULL, NULL, FALSE, 0, NULL, dir, &si, &pi)) {
-                    CloseHandle(pi.hThread); CloseHandle(pi.hProcess); free(b);
-                    if (g_wnd) PostMessage(g_wnd, WM_APP + 0x78, 0, 0); else ExitProcess(0);
-                    return 0;
+                    CloseHandle(pi.hThread);
+                    /* build 28: leave only once the new launcher really runs (its window is up); if it was stopped or deleted
+                       on the way, the old file goes back and this one stays open */
+                    int up = 0;
+                    for (int t = 0; t < 80 && !up; t++) {
+                        if (WaitForSingleObject(pi.hProcess, 250) == WAIT_OBJECT_0) break;
+                        HWND w = NULL; while ((w = FindWindowExW(NULL, w, L"UE4PSOLauncher", NULL))) { DWORD pid = 0; GetWindowThreadProcessId(w, &pid); if (pid == pi.dwProcessId) { up = 1; break; } }
+                    }
+                    CloseHandle(pi.hProcess);
+                    if (up) { free(b); if (g_wnd) PostMessage(g_wnd, WM_APP + 0x78, 0, 0); else ExitProcess(0); return 0; }
+                    LONGLONG nsz, nmt;
+                    if (!file_info(exe, &nsz, &nmt)) MoveFileExW(old, exe, MOVEFILE_REPLACE_EXISTING);
+                    llog("launcher update: the new launcher didn't start - staying on build %d", PSO_BUILD);
+                    set_status(-1, L"The new launcher couldn't start (antivirus?), so this one stays. Nothing else changes.");
+                    g_updating = 0; PostMessage(g_wnd, WM_REFRESH, 3, 0); free(b); return 0;
                 }
+                if (GetFileAttributesW(exe) == INVALID_FILE_ATTRIBUTES) MoveFileExW(old, exe, MOVEFILE_REPLACE_EXISTING);   /* no new file: the old one goes back */
                 set_status(-1, L"The launcher was updated. Close it and open it again to use the new one.");
                 g_updating = 0; PostMessage(g_wnd, WM_REFRESH, 3, 0); free(b); return 0;
             }
@@ -2086,7 +2120,7 @@ static DWORD WINAPI selfupd_thread(LPVOID u) {
         }
         int answered = b != NULL; free(b);
         /* nothing newer (or no answer): look again later, in case the launcher is left open for hours */
-        for (int t = 0; t < (answered || round > 3 ? 30 * 60 : 60); t++) Sleep(1000);
+        WaitForSingleObject(g_selfupd_evt, (answered || round > 3 ? 30 * 60 : 60) * 1000);   /* or sooner: a new signed list */
     }
 }
 
@@ -2112,7 +2146,7 @@ int WINAPI wWinMain(HINSTANCE hi, HINSTANCE prev, LPWSTR cmd, int show) {
     typedef BOOL (WINAPI *ctx_fn)(HANDLE);
     ctx_fn setctx = (ctx_fn)GetProcAddress(u32, "SetProcessDpiAwarenessContext");
     if (!setctx || !setctx((HANDLE)-4 /* PER_MONITOR_AWARE_V2 */)) SetProcessDPIAware();
-    InitializeCriticalSection(&g_cs); InitializeCriticalSection(&g_imgcs); InitializeCriticalSection(&g_selfcs);
+    InitializeCriticalSection(&g_cs); InitializeCriticalSection(&g_imgcs); InitializeCriticalSection(&g_selfcs); g_selfupd_evt = CreateEventW(NULL, FALSE, FALSE, NULL);
     { wchar_t me[MAX_PATH], old[MAX_PATH + 8]; if (GetModuleFileNameW(NULL, me, MAX_PATH)) { swprintf(old, MAX_PATH + 8, L"%ls.old", me); DeleteFileW(old); } }   /* left by an update */
     (void)g_build_tag;
     { ULONG_PTR tok; GpStartupInput gi = { 1, NULL, FALSE, FALSE }; GdiplusStartup(&tok, &gi, NULL); }
