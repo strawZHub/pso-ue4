@@ -2,6 +2,13 @@
 
 Every file list the PSO launcher (build 26+) accepts is signed by the server owner. The signing tool adds an entry here each time, automatically: what changed and the SHA-256 of every new or changed file. `file-list.txt` is the exact text of the newest signed list - check it with the public key in the README (`launcher/verify_file_list.py` does it for the live list).
 
+## 2026-11-27 19:12 UTC - version 47 - 122 entries
+
+- REMOVED `ProSoccerOnline/Binaries/Win64/xinput1_3.addon-off`
+
+Signed list SHA-256: `e058e87a116f68d975c482ab89e8f6d8651ec8c58d3f16fdcf16f6daa8859189`
+Signature: `4ccefa3d955eed68a9d0d06b14ec761175224e4dfedefb0ae68506561ac6eb83e6a42e6e0d58e88c11a0286f08269028203288bd60cd0a2c927748e5612d5a0e`
+
 ## 2026-11-27 17:36 UTC - version 47 - 123 entries
 
 - CHANGED `@launcher` - 1,368,064 bytes - sha256 `c9777ab5e964871fe5511a0b2ffb9c94c8081c29e413470a66e0a908c9f5c4e1`
