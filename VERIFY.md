@@ -13,18 +13,19 @@ certutil -hashfile xinput1_3.dll SHA256
 
 If the hash matches the one listed here (and on the release), your file is exactly the published one.
 
-## Launcher - build 26 (current)
+## Launcher - build 27 (current)
 
 ```
-SHA256:  3688a1ad7f4ea6386e26d59c916aac70eff382ab66dee4d4fd3e3a87db30cec8
-file:    PSOLauncher.exe  (1,371,648 bytes)
+SHA256:  8334a7db552693ae95b716bc531dd3bf9b4006e9caede10946c5ae45099ad5c1
+file:    PSOLauncher.exe  (1,374,208 bytes)
 built from: launcher/ at this commit + the launcher's pictures (art.h, app.ico)
 compiler: ziglang 0.17.1
 ```
 
-Build 26 checks the server's certificate and the owner's signature on the file list before downloading anything
-(README, "Security"). `launcher/verify_file_list.py` makes the same check from Python.
+Build 27 = build 26's security (certificate check, owner-signed file list, SHA-256; README "Security") plus
+"Ask before updating". `launcher/verify_file_list.py` makes the same check from Python.
 
+Build 26 (previous): `3688a1ad7f4ea6386e26d59c916aac70eff382ab66dee4d4fd3e3a87db30cec8`, 1,371,648 bytes.
 Build 25 (previous): `c9777ab5e964871fe5511a0b2ffb9c94c8081c29e413470a66e0a908c9f5c4e1`, 1,368,064 bytes.
 
 The launcher's pictures (the big header image, background, logo and icon) are not in this repository, so a

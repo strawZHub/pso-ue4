@@ -4,8 +4,10 @@
  * Server address: DEFAULT_SERVER, or "server=..." in PSOLauncher.ini next to the exe.
  * Build 26 (secure downloads): the server's certificate is checked like a browser does (no more "accept any certificate"),
  * the file list must carry the owner's signature (ECDSA P-256, public key below) before anything is downloaded, every file is
- * checked with SHA-256, and a launcher update is only taken when its SHA-256 is in that signed list. */
-#define PSO_BUILD 26          /* launcher build number (the self-update compares it) */
+ * checked with SHA-256, and a launcher update is only taken when its SHA-256 is in that signed list.
+ * Build 27: "Ask before updating" (Settings): game and launcher updates wait for the player, who first sees which files
+ * changed; the Steam label says what it is ("Your Steam account" - read from Steam on this PC, not a sign-in). */
+#define PSO_BUILD 27          /* launcher build number (the self-update compares it) */
 #define UNICODE
 #define _UNICODE
 #include <windows.h>
@@ -44,6 +46,7 @@ static wchar_t g_server[128] = DEFAULT_SERVER, g_base[MAX_PATH], g_game[MAX_PATH
 /* the player's own choices, kept in %LOCALAPPDATA%\UE4PSO\launcher-settings.txt */
 static int g_stay_open;               /* 1 = the launcher stays on screen while the game runs (0 = it hides and comes back afterwards) */
 static int g_anim_pref = 1;           /* 1 = opening, closing and the moving background */
+static int g_ask_upd;                 /* build 27: 1 = updates wait for the player, who sees the changed files first */
 static int g_sys_motion = 1;          /* Windows' own "show animations" switch */
 static volatile int g_updating;       /* a newer launcher is being put in place: nothing else may start */
 static volatile int g_ui_busy;        /* a Windows dialog of ours is open (folder choice) */
@@ -556,6 +559,24 @@ static volatile LONG g_recheck;          /* the game was just closed: look for a
 static volatile LONG g_play_pending;     /* Play was pressed: start the game once the update check is back */
 #define WM_PLAY_NOW (WM_APP + 0x79)
 
+/* build 27, "Ask before updating": which files change, and the player decides */
+static int confirm_update(int cnt, LONGLONG need) {
+    size_t cap = 8192; wchar_t *m = malloc(cap * sizeof(wchar_t)); int n = 0, shown = 0;
+    if (!m) return 1;
+    n += swprintf(m + n, cap - n, L"Update to version %d: %d file(s), %.1f MB.\n\n", g_version, cnt, need / 1048576.0);
+    for (int i = 0; i < g_nfiles && shown < 18; i++) {
+        if (!g_files[i].need) continue;
+        wchar_t w[400]; MultiByteToWideChar(CP_UTF8, 0, g_files[i].p, -1, w, 400);
+        n += swprintf(m + n, cap - n, L"\x2022 %ls  (%.1f MB)\n", w, g_files[i].s / 1048576.0); shown++; }
+    if (cnt > shown) n += swprintf(m + n, cap - n, L"\x2022 ... and %d more\n", cnt - shown);
+    swprintf(m + n, cap - n, L"\nThe list is signed by the server owner, and every file is checked (SHA-256) before it is used.\n"
+                             L"You can check the list yourself with verify_file_list.py (github.com/strawZHub/pso-ue4).\n\nInstall this update now?");
+    g_ui_busy = 1;
+    int a = MessageBoxW(g_wnd, m, L"PSO UE4 Launcher \x2022 update", MB_YESNO | MB_ICONQUESTION);
+    g_ui_busy = 0; free(m);
+    return a == IDYES;
+}
+
 /* wait for a click, or (auto > 0) retry by itself after that many seconds */
 static void wait_click(int auto_secs) {
     for (int t = 0; !g_go; t++) {
@@ -652,9 +673,15 @@ static DWORD WINAPI worker(LPVOID u) {
         /* An update for a game that's already installed starts by itself (like Steam) - as soon as the game isn't running.
            The first install still waits for the player to press Install (it's big, and they may want another folder). */
         if (g_auto_retry) g_go = 0;
-        else if (g_installed_once) { while (game_running() && !g_go) Sleep(1000); g_go = 0; }
+        else if (g_installed_once && !g_ask_upd) { while (game_running() && !g_go) Sleep(1000); g_go = 0; }
         else wait_click(0);
         if (g_reloc) { g_reloc = 0; continue; }           /* another folder was chosen: check that one first */
+        if (g_ask_upd && g_installed_once && !g_auto_retry && !confirm_update(cnt, need)) {   /* build 27: the player said not now */
+            set_status(ST_NEED, L"Update available \x2022 version %d \x2022 %d file(s) \x2022 press Update when you want it", g_version, cnt);
+            continue; }
+        if (g_ask_upd && g_installed_once && game_running()) {                  /* (files of a running game can't be replaced) */
+            set_status(-1, L"Close the game and the update starts.");
+            while (game_running()) Sleep(1000); }
 
         ULARGE_INTEGER freeb; wchar_t droot[4] = { g_game[0], L':', L'\\', 0 };
         if (GetDiskFreeSpaceExW(g_game[1] == L':' ? droot : g_base, &freeb, NULL, NULL) && (LONGLONG)freeb.QuadPart < need + (256LL << 20)) {
@@ -967,7 +994,7 @@ static void fmt_last(long long t, wchar_t *out, int cap) {
 }
 
 /* ------------------------------------------------------------ layout */
-typedef struct { int W, H, M, tb; RECT hero, act, play, bmin, bclose, notes, server, title, gear, change, set, sclose, tog[2], sfolder, slink; } Layout;
+typedef struct { int W, H, M, tb; RECT hero, act, play, bmin, bclose, notes, server, title, gear, change, set, sclose, tog[3], sfolder, slink; } Layout;
 static Layout L;
 static void layout_wh(int cw, int ch);
 static void calc_layout(HWND h) { RECT rc; GetClientRect(h, &rc); layout_wh(rc.right, rc.bottom); }
@@ -985,13 +1012,13 @@ static void layout_wh(int cw, int ch) {
     SetRect(&L.gear, L.W - L.M - S(112), S(13), L.W - L.M - S(80), S(45));
     SetRect(&L.change, L.act.right - S(274) - S(22) - S(86), L.act.top + S(30), L.act.right - S(274) - S(22), L.act.top + S(58));
     {   /* the settings card, in the middle of the window */
-        int cw = S(520), ch = S(392); if (cw > L.W - 2 * L.M) cw = L.W - 2 * L.M; if (ch > L.H - 2 * L.M) ch = L.H - 2 * L.M;
+        int cw = S(520), ch = S(462); if (cw > L.W - 2 * L.M) cw = L.W - 2 * L.M; if (ch > L.H - 2 * L.M) ch = L.H - 2 * L.M;
         int x = (L.W - cw) / 2, y = (L.H - ch) / 2;
         SetRect(&L.set, x, y, x + cw, y + ch);
         SetRect(&L.sclose, x + cw - S(48), y + S(13), x + cw - S(18), y + S(43));
-        for (int i = 0; i < 2; i++) SetRect(&L.tog[i], x + cw - S(24) - S(44), y + S(76) + i * S(70), x + cw - S(24), y + S(76) + i * S(70) + S(24));
-        SetRect(&L.slink, x + cw - S(24) - S(100), y + S(76) + 2 * S(70) - S(2), x + cw - S(24), y + S(76) + 2 * S(70) + S(26));
-        SetRect(&L.sfolder, x + cw - S(24) - S(78), y + S(76) + 3 * S(70) - S(2), x + cw - S(24), y + S(76) + 3 * S(70) + S(26));
+        for (int i = 0; i < 3; i++) SetRect(&L.tog[i], x + cw - S(24) - S(44), y + S(76) + i * S(70), x + cw - S(24), y + S(76) + i * S(70) + S(24));
+        SetRect(&L.slink, x + cw - S(24) - S(100), y + S(76) + 3 * S(70) - S(2), x + cw - S(24), y + S(76) + 3 * S(70) + S(26));
+        SetRect(&L.sfolder, x + cw - S(24) - S(78), y + S(76) + 4 * S(70) - S(2), x + cw - S(24), y + S(76) + 4 * S(70) + S(26));
     }
     int cy = L.act.bottom + S(14), rw = S(330);
     SetRect(&L.notes, L.M, cy, L.W - L.M - rw - S(14), L.H - L.M);
@@ -1000,7 +1027,7 @@ static void layout_wh(int cw, int ch) {
 static int in_rect(const RECT *r, int x, int y) { return x >= r->left && x < r->right && y >= r->top && y < r->bottom; }
 
 /* ------------------------------------------------------------ interaction state */
-enum { HOT_NONE, HOT_PLAY, HOT_MIN, HOT_CLOSE, HOT_GEAR, HOT_CHANGE, HOT_SCLOSE, HOT_TOG1, HOT_TOG2, HOT_SFOLDER, HOT_SLINK, HOT_SOUT };
+enum { HOT_NONE, HOT_PLAY, HOT_MIN, HOT_CLOSE, HOT_GEAR, HOT_CHANGE, HOT_SCLOSE, HOT_TOG1, HOT_TOG2, HOT_TOG3, HOT_SFOLDER, HOT_SLINK, HOT_SOUT };
 /* Discord link (PUGs): 0 nothing yet, 1 waiting for the Steam sign-in in the browser, 2 checking, 3 code ready, 4 a message */
 static volatile int g_link_state;
 static wchar_t g_link_text[300];
@@ -1304,7 +1331,7 @@ static void draw_action(HDC m, void *G) {
         GdipResetClip(G); GdipDeletePath(clip);
         text(m, f_valb, RGB(255, 255, 255), ax + av + S(14), avy + S(2), S(180), S(24), g_steam.name, DT_SINGLELINE | DT_END_ELLIPSIS);
         dot(G, ax + av + S(15), avy + S(33), S(7), ARGB(255, 120, 226, 140));
-        text(m, f_small, C_GREEN, ax + av + S(28), avy + S(27), S(170), S(20), g_state == ST_RUNNING ? L"In game" : L"Connected with Steam", DT_SINGLELINE);
+        text(m, f_small, C_GREEN, ax + av + S(28), avy + S(27), S(170), S(20), g_state == ST_RUNNING ? L"In game" : L"Your Steam account", DT_SINGLELINE);
     } else {
         text(m, f_valb, C_DIM, ax, avy + S(2), S(240), S(24), L"Steam not found", DT_SINGLELINE);
         text(m, f_small, C_LBL, ax, avy + S(28), S(240), S(20), L"Open Steam to see your stats", DT_SINGLELINE);
@@ -1423,14 +1450,15 @@ static void draw_settings(HDC m, void *G) {
         void *pen; GdipCreatePen1(ARGB(hot ? 255 : 200, 255, 255, 255), (float)S(2) * 0.7f, 2, &pen);
         GdipDrawLineI(G, pen, cx - k, cy - k, cx + k, cy + k); GdipDrawLineI(G, pen, cx - k, cy + k, cx + k, cy - k); GdipDeletePen(pen); }
     { void *b; GdipCreateSolidFill(ARGB(18, 255, 255, 255), &b); GdipFillRectangleI(G, b, s.left + S(22), s.top + S(54), sw - S(44), 1); GdipDeleteBrush(b); }
-    static const wchar_t *tt[2] = { L"Keep the launcher open while playing", L"Animations" };
-    static const wchar_t *sub[2] = { L"Off: the launcher hides when the game starts and comes back when you close the game.",
-                                     L"The opening, the closing and the moving background. Turn off for a still launcher." };
-    int on[2] = { g_stay_open, g_anim_pref };
-    for (int i = 0; i < 2; i++) { RECT t = L.tog[i]; int tw = t.left - S(18) - x;
+    static const wchar_t *tt[3] = { L"Keep the launcher open while playing", L"Animations", L"Ask before updating" };
+    static const wchar_t *sub[3] = { L"Off: the launcher hides when the game starts and comes back when you close the game.",
+                                     L"The opening, the closing and the moving background. Turn off for a still launcher.",
+                                     L"On: updates wait for you. You see which files changed first, then press Update." };
+    int on[3] = { g_stay_open, g_anim_pref, g_ask_upd };
+    for (int i = 0; i < 3; i++) { RECT t = L.tog[i]; int tw = t.left - S(18) - x;
         text(m, f_valb, RGB(255, 255, 255), x, t.top - S(4), tw, S(22), tt[i], DT_SINGLELINE | DT_END_ELLIPSIS);
         text(m, f_small, C_DIM, x, t.top + S(20), tw, S(36), sub[i], DT_WORDBREAK);
-        toggle(G, t, on[i], g_hot == (i ? HOT_TOG2 : HOT_TOG1)); }
+        toggle(G, t, on[i], g_hot == (i == 2 ? HOT_TOG3 : i ? HOT_TOG2 : HOT_TOG1)); }
     {   RECT b = L.slink; int bw = b.right - b.left, bh = b.bottom - b.top, busy = g_link_state == 1 || g_link_state == 2,
             hot = !busy && g_hot == HOT_SLINK, tw = b.left - S(18) - x;
         text(m, f_valb, RGB(255, 255, 255), x, b.top - S(2), tw, S(22), L"Discord link (PUGs)", DT_SINGLELINE);
@@ -1635,6 +1663,7 @@ static int hit_item(int x, int y) {
         if (in_rect(&L.sclose, x, y)) return HOT_SCLOSE;
         if (in_rect(&L.tog[0], x, y)) return HOT_TOG1;
         if (in_rect(&L.tog[1], x, y)) return HOT_TOG2;
+        if (in_rect(&L.tog[2], x, y)) return HOT_TOG3;
         if (in_rect(&L.sfolder, x, y)) return HOT_SFOLDER;
         if (in_rect(&L.slink, x, y)) return HOT_SLINK;
         return in_rect(&L.set, x, y) ? HOT_NONE : HOT_SOUT;
@@ -1653,7 +1682,7 @@ static void save_settings(void) {
     wchar_t p[MAX_PATH * 2]; char dir[MAX_PATH * 4] = ""; settings_file(p);
     WideCharToMultiByte(CP_UTF8, 0, g_game, -1, dir, sizeof dir, NULL, NULL);
     FILE *f = _wfopen(p, L"wb"); if (!f) return;
-    fprintf(f, "gamedir=%s\r\nstayopen=%d\r\nanimations=%d\r\n", dir, g_stay_open, g_anim_pref); fclose(f);
+    fprintf(f, "gamedir=%s\r\nstayopen=%d\r\nanimations=%d\r\naskupdates=%d\r\n", dir, g_stay_open, g_anim_pref, g_ask_upd); fclose(f);
 }
 static void load_settings(void) {
     wchar_t p[MAX_PATH * 2]; char line[MAX_PATH * 4]; settings_file(p);
@@ -1661,7 +1690,8 @@ static void load_settings(void) {
     while (fgets(line, sizeof line, f)) { line[strcspn(line, "\r\n")] = 0;
         if (!strncmp(line, "gamedir=", 8) && line[8]) { wchar_t w[MAX_PATH]; if (MultiByteToWideChar(CP_UTF8, 0, line + 8, -1, w, MAX_PATH) > 3 && w[1] == L':') wcscpy(g_game, w); }
         else if (!strncmp(line, "stayopen=", 9)) g_stay_open = line[9] == '1';
-        else if (!strncmp(line, "animations=", 11)) g_anim_pref = line[11] != '0'; }
+        else if (!strncmp(line, "animations=", 11)) g_anim_pref = line[11] != '0';
+        else if (!strncmp(line, "askupdates=", 11)) g_ask_upd = line[11] == '1'; }
     fclose(f);
 }
 
@@ -1865,6 +1895,7 @@ static LRESULT CALLBACK wndproc(HWND h, UINT msg, WPARAM w, LPARAM l) {
         else if (it == HOT_SCLOSE || it == HOT_SOUT) { g_settings = 0; g_hot = HOT_NONE; touch(h); }
         else if (it == HOT_TOG1) { g_stay_open = !g_stay_open; save_settings(); touch_rc(h, &L.set); }
         else if (it == HOT_TOG2) { g_anim_pref = !g_anim_pref; g_motion = g_sys_motion && g_anim_pref; save_settings(); touch(h); }
+        else if (it == HOT_TOG3) { g_ask_upd = !g_ask_upd; save_settings(); touch_rc(h, &L.set); }
         else if (it == HOT_SLINK) link_start(h);
         else if (it == HOT_SFOLDER) { if (GetFileAttributesW(g_game) != INVALID_FILE_ATTRIBUTES) ShellExecuteW(h, L"open", g_game, NULL, NULL, SW_SHOWNORMAL); }
         else if (it == HOT_CHANGE && !g_updating) choose_install_dir(h);
@@ -2013,6 +2044,15 @@ static DWORD WINAPI selfupd_thread(LPVOID u) {
             else { hex_of(d, 32, hx); if (strcmp(hx, want_h)) { llog("launcher update: not the signed file, ignored"); free(b); b = NULL; } }
         }
         int got = b && su_valid(b, n) ? su_build(b, n) : 0;
+        static int declined;                                             /* build 27: "not now" lasts until the launcher restarts */
+        if (got > PSO_BUILD && g_ask_upd) {
+            if (got <= declined) { free(b); for (int t = 0; t < 30 * 60; t++) Sleep(1000); continue; }
+            for (int quiet = 0; quiet < 4; ) { quiet = su_quiet() ? quiet + 1 : 0; Sleep(250); }
+            wchar_t q[400]; swprintf(q, 400, L"Launcher build %d is available (you have build %d).\n\nIt is the exact file named in the server owner's signed list "
+                                             L"(SHA-256 checked). The launcher restarts after it is put in place.\n\nInstall it now?", got, PSO_BUILD);
+            g_ui_busy = 1; int a = MessageBoxW(g_wnd, q, L"PSO UE4 Launcher \x2022 launcher update", MB_YESNO | MB_ICONQUESTION); g_ui_busy = 0;
+            if (a != IDYES) { declined = got; free(b); continue; }
+        }
         if (got > PSO_BUILD) {
             for (int quiet = 0; quiet < 4; ) { quiet = su_quiet() ? quiet + 1 : 0; Sleep(250); }      /* a calm second first (and never while playing) */
             g_updating = 1; PostMessage(g_wnd, WM_REFRESH, 3, 0);
