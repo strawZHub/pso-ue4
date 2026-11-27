@@ -128,7 +128,9 @@ static void read_achievements(const wchar_t *steam, unsigned accountid) {
 
 /* Linux / Mac (Wine, Proton, CrossOver): the real Steam folder is outside the Windows side, reached through drive Z:.
    Wine passes the unix HOME on, so the usual places are tried. */
-static int is_wine(void) { HMODULE nt = GetModuleHandleW(L"ntdll.dll"); return nt && GetProcAddress(nt, "wine_get_version") != NULL; }
+/* build 26: Wine is recognised by the registry key it always makes (HKCU\Software\Wine) - not by looking into Windows' own
+   ntdll.dll, which antivirus sandboxes report as "checks for a virtual machine" */
+static int is_wine(void) { HKEY k; if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\Wine", 0, KEY_READ, &k)) return 0; RegCloseKey(k); return 1; }
 static int has_loginusers(const wchar_t *dir) {
     wchar_t p[MAX_PATH * 2]; swprintf(p, MAX_PATH * 2, L"%ls\\config\\loginusers.vdf", dir); return GetFileAttributesW(p) != INVALID_FILE_ATTRIBUTES;
 }

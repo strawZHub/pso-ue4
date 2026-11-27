@@ -7,7 +7,7 @@ This repository contains **only the player-side code**:
 | Folder | What it is |
 |---|---|
 | `addon/` | `xinput1_3.dll`: an add-on loaded by the game. It adds a dark **Moon** menu theme with an in-game Sun / Moon switch, coloured name tags and the scoreboard style, **goal effects** (visuals, sounds and a picker in the menu), a Goal Effects setting in Settings > Video, and keeps the launcher up to date. |
-| `launcher/` | `PSOLauncher.exe` (**build 25**, the one players use): installs and updates the game files from a PSO server, starts the game, hides while you play and comes back when the game closes. **Download it from [Releases](../../releases).** |
+| `launcher/` | `PSOLauncher.exe` (**build 26**, the one players use): installs and updates the game files from a PSO server, starts the game, hides while you play and comes back when the game closes. **Download it from [Releases](../../releases).** |
 
 **Not included, on purpose:**
 - The game itself (executable, `.pak` files, art). *Pro Soccer Online* belongs to Skywall Studios. Get it on Steam.
@@ -41,15 +41,32 @@ Files:
 ## What the launcher does
 
 So nobody has to guess (everything is in `launcher/psolauncher.c`):
-- Talks to the community server `play.pso-ue4.com` (HTTPS) for the file list, news and launcher updates.
-- Downloads the game files into the folder you choose, checking each file's SHA-1. Big files come from the server's Cloudflare storage (`files.pso-ue4.com`) when available, otherwise from the server itself.
-- Reads your Steam account name, avatar, Pro Soccer Online play time and achievements from your own Steam folder (`steamstats.h`, read only) to show them in the launcher window. None of that is sent anywhere.
+- Talks to the community server `play.pso-ue4.com` over HTTPS for the file list, news and launcher updates. Since build 26 the server's certificate is checked by Windows like in a browser (Let's Encrypt); if it can't be verified, the launcher downloads nothing.
+- Downloads nothing unless the file list carries the server owner's signature (see **Security** below).
+- Downloads the game files into the folder you choose and checks each file's SHA-256 against the signed list. Big files come from the server's Cloudflare storage (`files.pso-ue4.com`) when available, otherwise from the server itself - either way the same SHA-256 check applies.
+- Reads your Steam account name, avatar, Pro Soccer Online play time and achievements from your own Steam folder (`steamstats.h`, read only) to show them in the launcher window, only once Steam is running. None of that is sent anywhere.
 - Sends your SteamID64 to the server only when you press **GET CODE** to link Discord (`/link/code`), together with a random per-PC code the game add-on saved, so nobody can link your account from another PC. It never asks for or reads your Steam password.
-- Starts the game, hides while you play, and checks for updates when the game closes. It can replace itself with a newer launcher build from the server.
+- Starts the game, hides while you play, and checks for updates when the game closes. It can replace itself with a newer launcher build from the server, but only with the exact file (size and SHA-256) named in the signed list.
+- On Linux/Mac (Wine, Proton) it finds the real Steam folder; it recognises Wine by the `HKCU\Software\Wine` registry key Wine creates.
 - Logs to `%LOCALAPPDATA%\UE4PSO\launcher.log`.
 - The font is Space Grotesk (SIL Open Font License 1.1, see the note at the top of `fonts.h`).
 
 Settings are saved in `%LOCALAPPDATA%\UE4PSO` (`theme.txt`, `goalfx-on.txt`, ...), and the log is `pso-addon.log` in the same folder.
+
+## Security (launcher build 26+)
+
+- **Transport:** HTTPS with normal certificate checking (no "accept any certificate" flags, no fallback to a bare IP address).
+- **Signed file list:** the server owner signs, on their own PC, this text with an ECDSA P-256 key that never leaves that PC:
+  `PSO-FILES-1`, then one line per game file `path<TAB>size<TAB>sha256` (sorted by path), then `@launcher<TAB>size<TAB>sha256`
+  for the launcher the server hands out. The server includes the signature as `"sig"` in `/launcher/manifest`; the launcher
+  rebuilds the same text from the list it received and checks the signature with the public key built into it
+  (`FILES_PUB` in `launcher/psolauncher.c`). If the signature is missing or wrong, nothing is downloaded and no launcher update is taken.
+  So even someone who took over the connection or the server itself couldn't push other files.
+- **Files:** SHA-256 per file (SHA-1 is only kept as the file's name on the Cloudflare storage).
+- **Check it yourself:** `python launcher/verify_file_list.py` checks the server's list and signature with the same rules;
+  `python launcher/verify_file_list.py "<your game folder>"` also checks every installed file against it.
+- Public key (X || Y): `05a82c0ae69e0a1ef691234ccd3069454327cd2844d405ba8a34e925f172e9174e27c188d95e48f007531b11cee723ae2bc5c75833fc68cee2340ad2d652ee3f`
+- Not covered: the very first download of the launcher itself - check its SHA-256 against the release (see VERIFY.md).
 
 ## Building
 
@@ -67,7 +84,7 @@ zig cc -target x86_64-windows-gnu pso_addon.c xinput1_3.def -lwinhttp -luser32 -
 3. Build (zig 0.17.1, `pip install ziglang==0.17.1`):
 ```
 cd launcher
-python -m ziglang cc -target x86_64-windows-gnu -O2 -DUNICODE -municode -Wl,--subsystem,windows psolauncher.c app.rc -lwinhttp -lbcrypt -ldwmapi -lshell32 -lshlwapi -lole32 -lgdi32 -luser32 -lgdiplus -o PSOLauncher.exe
+python -m ziglang cc -target x86_64-windows-gnu -O2 -DUNICODE -municode -Wl,--subsystem,windows psolauncher.c app.rc -lwinhttp -lbcrypt -ldwmapi -lshell32 -lshlwapi -lole32 -lgdi32 -luser32 -lgdiplus -ladvapi32 -o PSOLauncher.exe
 ```
 (`-Wl,--subsystem,windows` matters: without it zig makes a command-prompt program.)
 

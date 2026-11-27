@@ -1,8 +1,11 @@
 /* PSOLauncher.exe - "PSO UE4 Launcher"
  * Installs / updates the private-server version of Pro Soccer Online from the PSO server and starts it.
  * Game goes to %LOCALAPPDATA%\UE4PSO\Game (no admin rights needed, Steam's copy is untouched).
- * Server address: DEFAULT_SERVER (BACKUP_SERVER when it does not answer), or "server=..." in PSOLauncher.ini next to the exe. */
-#define PSO_BUILD 25          /* launcher build number (the self-update compares it) */
+ * Server address: DEFAULT_SERVER, or "server=..." in PSOLauncher.ini next to the exe.
+ * Build 26 (secure downloads): the server's certificate is checked like a browser does (no more "accept any certificate"),
+ * the file list must carry the owner's signature (ECDSA P-256, public key below) before anything is downloaded, every file is
+ * checked with SHA-256, and a launcher update is only taken when its SHA-256 is in that signed list. */
+#define PSO_BUILD 26          /* launcher build number (the self-update compares it) */
 #define UNICODE
 #define _UNICODE
 #include <windows.h>
@@ -22,8 +25,9 @@
 #include <shlobj.h>
 #include <shobjidl.h>
 
-#define DEFAULT_SERVER L"play.pso-ue4.com"       /* a name, so the server can move without a new launcher */
-#define BACKUP_SERVER  L"64.235.34.135"          /* used when the name does not answer */
+#define DEFAULT_SERVER L"play.pso-ue4.com"       /* a name, so the server can move without a new launcher (and the certificate is for it) */
+/* the owner's file-list key (public half; the private half never leaves the owner's PC): X || Y of an ECDSA P-256 key */
+static const unsigned char FILES_PUB[64] = { 0x05, 0xa8, 0x2c, 0x0a, 0xe6, 0x9e, 0x0a, 0x1e, 0xf6, 0x91, 0x23, 0x4c, 0xcd, 0x30, 0x69, 0x45, 0x43, 0x27, 0xcd, 0x28, 0x44, 0xd4, 0x05, 0xba, 0x8a, 0x34, 0xe9, 0x25, 0xf1, 0x72, 0xe9, 0x17, 0x4e, 0x27, 0xc1, 0x88, 0xd9, 0x5e, 0x48, 0xf0, 0x07, 0x53, 0x1b, 0x11, 0xce, 0xe7, 0x23, 0xae, 0x2b, 0xc5, 0xc7, 0x58, 0x33, 0xfc, 0x68, 0xce, 0xe2, 0x34, 0x0a, 0xd2, 0xd6, 0x52, 0xee, 0x3f };
 #define WM_REFRESH (WM_APP + 1)
 
 /* ------------------------------------------------------------ state shared with the UI */
@@ -52,31 +56,24 @@ static void set_status(int st, const wchar_t *fmt, ...) {
     PostMessage(g_wnd, WM_REFRESH, 3, 0);      /* 3 = state / status line */
 }
 
-/* ------------------------------------------------------------ HTTP (self-signed cert accepted) */
+/* ------------------------------------------------------------ HTTP (HTTPS, certificate checked by Windows) */
 static HINTERNET g_ses; static int g_from_ini;
+static volatile DWORD g_net_err;                 /* last connection error (ERROR_WINHTTP_SECURE_FAILURE etc.) */
+static int tls_error(DWORD e) { return e == 12175 /* SECURE_FAILURE */ || e == 12037 || e == 12038 || e == 12044 || e == 12045 || e == 12169 || e == 12179 || e == 12157; }
 static HINTERNET open_req_r(const wchar_t *path, LONGLONG range_from, LONGLONG range_to);
 static HINTERNET open_req(const wchar_t *path, LONGLONG range_from) { return open_req_r(path, range_from, -1); }
 static HINTERNET open_req_r(const wchar_t *path, LONGLONG range_from, LONGLONG range_to) {   /* range_to: last byte wanted, -1 = to the end */
-    static int use_backup;                       /* once the name has failed and the backup answered, stay on the backup for this run */
-    for (int attempt = use_backup; attempt < 2; attempt++) {
-    const wchar_t *host = attempt ? BACKUP_SERVER : g_server;
-    if (attempt && (g_from_ini || !wcscmp(g_server, BACKUP_SERVER))) break;
-    HINTERNET c = WinHttpConnect(g_ses, host, 443, 0);
-    if (!c) continue;
+    HINTERNET c = WinHttpConnect(g_ses, g_server, 443, 0);
+    if (!c) { g_net_err = GetLastError(); return NULL; }
     HINTERNET r = WinHttpOpenRequest(c, L"GET", path, NULL, NULL, NULL, WINHTTP_FLAG_SECURE);
-    if (!r) { WinHttpCloseHandle(c); continue; }
-    DWORD fl = SECURITY_FLAG_IGNORE_UNKNOWN_CA | SECURITY_FLAG_IGNORE_CERT_CN_INVALID | SECURITY_FLAG_IGNORE_CERT_DATE_INVALID
-             | SECURITY_FLAG_IGNORE_CERT_WRONG_USAGE;
-    WinHttpSetOption(r, WINHTTP_OPTION_SECURITY_FLAGS, &fl, sizeof fl);
+    if (!r) { g_net_err = GetLastError(); WinHttpCloseHandle(c); return NULL; }
     wchar_t hdr[64] = L"";
     if (range_to >= 0) swprintf(hdr, 64, L"Range: bytes=%lld-%lld", range_from, range_to);
     else if (range_from > 0) swprintf(hdr, 64, L"Range: bytes=%lld-", range_from);
     if (!WinHttpSendRequest(r, hdr[0] ? hdr : WINHTTP_NO_ADDITIONAL_HEADERS, hdr[0] ? (DWORD)-1L : 0, NULL, 0, 0, 0)
-        || !WinHttpReceiveResponse(r, NULL)) { WinHttpCloseHandle(r); WinHttpCloseHandle(c); continue; }
-    if (attempt) use_backup = 1;
+        || !WinHttpReceiveResponse(r, NULL)) { g_net_err = GetLastError(); WinHttpCloseHandle(r); WinHttpCloseHandle(c); return NULL; }
+    g_net_err = 0;
     return r;   /* connection handle is closed together with the session; fine for this program */
-    }
-    return NULL;
 }
 static HINTERNET open_req_host(const wchar_t *host, const wchar_t *path, LONGLONG range_from, LONGLONG range_to) {
     HINTERNET c = WinHttpConnect(g_ses, host, 443, 0); if (!c) return NULL;
@@ -108,23 +105,15 @@ static char *http_get(const wchar_t *path, DWORD *code) {
     return buf;
 }
 
-/* POST a JSON body; the answer like http_get. Like every other request it falls back to the server's address when the
-   name does not answer. */
+/* POST a JSON body; the answer like http_get (certificate checked, like every request) */
 static char *http_post_one(const wchar_t *host, const wchar_t *path, const char *json, DWORD *code);
-static char *http_post_json(const wchar_t *path, const char *json, DWORD *code) {
-    char *r = http_post_one(g_server, path, json, code);
-    if (!r && !g_from_ini && wcscmp(g_server, BACKUP_SERVER)) r = http_post_one(BACKUP_SERVER, path, json, code);
-    return r;
-}
+static char *http_post_json(const wchar_t *path, const char *json, DWORD *code) { return http_post_one(g_server, path, json, code); }
 static char *http_post_one(const wchar_t *host, const wchar_t *path, const char *json, DWORD *code) {
     *code = 0;
     HINTERNET c = WinHttpConnect(g_ses, host, 443, 0);
     if (!c) return NULL;
     HINTERNET r = WinHttpOpenRequest(c, L"POST", path, NULL, NULL, NULL, WINHTTP_FLAG_SECURE);
     if (!r) { WinHttpCloseHandle(c); return NULL; }
-    DWORD fl = SECURITY_FLAG_IGNORE_UNKNOWN_CA | SECURITY_FLAG_IGNORE_CERT_CN_INVALID | SECURITY_FLAG_IGNORE_CERT_DATE_INVALID
-             | SECURITY_FLAG_IGNORE_CERT_WRONG_USAGE;
-    WinHttpSetOption(r, WINHTTP_OPTION_SECURITY_FLAGS, &fl, sizeof fl);
     DWORD n = (DWORD)strlen(json);
     if (!WinHttpSendRequest(r, L"Content-Type: application/json", (DWORD)-1L, (void *)json, n, n, 0) || !WinHttpReceiveResponse(r, NULL)) {
         WinHttpCloseHandle(r); WinHttpCloseHandle(c); return NULL; }
@@ -178,13 +167,16 @@ static wchar_t *json_wstr(const char *s, const char *key) {
 }
 
 /* ------------------------------------------------------------ files */
-typedef struct { char p[400]; LONGLONG s; char h[41]; int need, cdn; } FileEnt;   /* cdn: the server says this file is also on its Cloudflare storage */
+typedef struct { char p[400]; LONGLONG s; char h[41], h2[65]; int need, cdn; } FileEnt;   /* h: SHA-1 (only names the file on Cloudflare), h2: SHA-256 (what is checked); cdn: also on the server's Cloudflare storage */
 static wchar_t g_cdn[128];              /* e.g. files.pso-ue4.com (from the manifest), empty = none */
 static volatile int g_cdn_bad;          /* Cloudflare failed in this run: only the server from then on (small files) */
 static volatile LONG g_cdn_nofail;      /* Cloudflare connections that failed in a row */
 static FileEnt *g_files; static int g_nfiles, g_version;
+static void llog(const char *fmt, ...);
+static volatile int g_signed;                    /* the file list now in g_files carries the owner's valid signature */
+static CRITICAL_SECTION g_selfcs; static LONGLONG g_self_s; static char g_self_h2[65];   /* the launcher the signed list names (0 = none) */
 
-typedef struct { char p[400]; LONGLONG s; LONGLONG mt; char h[41]; } CacheEnt;
+typedef struct { char p[400]; LONGLONG s; LONGLONG mt; char h[65]; } CacheEnt;   /* h = SHA-256 */
 static CacheEnt *g_cache; static int g_ncache;
 
 static void path_of(const char *rel, wchar_t *out) {
@@ -205,33 +197,33 @@ static int file_info(const wchar_t *path, LONGLONG *size, LONGLONG *mtime) {
 }
 
 static void load_cache(void) {
-    wchar_t path[MAX_PATH * 2]; swprintf(path, MAX_PATH * 2, L"%ls\\files.cache", g_base);
+    wchar_t path[MAX_PATH * 2]; swprintf(path, MAX_PATH * 2, L"%ls\\files2.cache", g_base);   /* build 26: SHA-256 (files.cache had SHA-1) */
     FILE *f = _wfopen(path, L"r"); if (!f) return;
     char line[600];
     g_cache = calloc(4096, sizeof(CacheEnt));
     while (g_ncache < 4096 && fgets(line, sizeof line, f)) {
         CacheEnt *c = &g_cache[g_ncache];
-        if (sscanf(line, "%40[0-9a-f]|%lld|%lld|%399[^\r\n]", c->h, &c->s, &c->mt, c->p) == 4) g_ncache++;
+        if (sscanf(line, "%64[0-9a-f]|%lld|%lld|%399[^\r\n]", c->h, &c->s, &c->mt, c->p) == 4 && strlen(c->h) == 64) g_ncache++;
     }
     fclose(f);
 }
 static void save_cache(void) {
-    wchar_t path[MAX_PATH * 2]; swprintf(path, MAX_PATH * 2, L"%ls\\files.cache", g_base);
+    wchar_t path[MAX_PATH * 2]; swprintf(path, MAX_PATH * 2, L"%ls\\files2.cache", g_base);   /* build 26: SHA-256 (files.cache had SHA-1) */
     FILE *f = _wfopen(path, L"w"); if (!f) return;
     for (int i = 0; i < g_nfiles; i++) {
         wchar_t fp[MAX_PATH * 2]; LONGLONG s, mt;
         path_of(g_files[i].p, fp);
-        if (!g_files[i].need && file_info(fp, &s, &mt)) fprintf(f, "%s|%lld|%lld|%s\n", g_files[i].h, s, mt, g_files[i].p);
+        if (!g_files[i].need && file_info(fp, &s, &mt)) fprintf(f, "%s|%lld|%lld|%s\n", g_files[i].h2, s, mt, g_files[i].p);
     }
     fclose(f);
 }
 
-/* SHA-1 of a file (with progress for big files) */
-static int sha1_file(const wchar_t *path, char out[41], int show) {
-    BCRYPT_ALG_HANDLE alg; BCRYPT_HASH_HANDLE h; unsigned char dig[20];
+/* SHA-256 of a file (with progress for big files) */
+static int sha256_file(const wchar_t *path, char out[65], int show) {
+    BCRYPT_ALG_HANDLE alg; BCRYPT_HASH_HANDLE h; unsigned char dig[32];
     HANDLE f = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, NULL);
     if (f == INVALID_HANDLE_VALUE) return 0;
-    if (BCryptOpenAlgorithmProvider(&alg, BCRYPT_SHA1_ALGORITHM, NULL, 0)) { CloseHandle(f); return 0; }
+    if (BCryptOpenAlgorithmProvider(&alg, BCRYPT_SHA256_ALGORITHM, NULL, 0)) { CloseHandle(f); return 0; }
     BCryptCreateHash(alg, &h, NULL, 0, NULL, 0, 0);
     unsigned char *buf = (unsigned char *)malloc(1 << 20); DWORD got; LONGLONG tot = 0, size, mt;   /* (own buffer: files are checked by several threads) */
     if (!buf) { BCryptDestroyHash(h); BCryptCloseAlgorithmProvider(alg, 0); CloseHandle(f); return 0; }
@@ -243,16 +235,61 @@ static int sha1_file(const wchar_t *path, char out[41], int show) {
             set_status(-1, L"Checking game files... %d%%", (int)(tot * 100 / size));
     }
     free(buf);
-    BCryptFinishHash(h, dig, 20, 0);
+    BCryptFinishHash(h, dig, 32, 0);
     BCryptDestroyHash(h); BCryptCloseAlgorithmProvider(alg, 0); CloseHandle(f);
-    for (int i = 0; i < 20; i++) sprintf(out + i * 2, "%02x", dig[i]);
+    for (int i = 0; i < 32; i++) sprintf(out + i * 2, "%02x", dig[i]);
     return 1;
+}
+static int sha256_buf(const void *data, size_t n, unsigned char dig[32]) {
+    BCRYPT_ALG_HANDLE alg; BCRYPT_HASH_HANDLE h; int ok = 0;
+    if (BCryptOpenAlgorithmProvider(&alg, BCRYPT_SHA256_ALGORITHM, NULL, 0)) return 0;
+    if (!BCryptCreateHash(alg, &h, NULL, 0, NULL, 0, 0)) {
+        ok = !BCryptHashData(h, (PUCHAR)data, (ULONG)n, 0) && !BCryptFinishHash(h, dig, 32, 0);
+        BCryptDestroyHash(h); }
+    BCryptCloseAlgorithmProvider(alg, 0);
+    return ok;
+}
+static void hex_of(const unsigned char *b, int n, char *out) { for (int i = 0; i < n; i++) sprintf(out + i * 2, "%02x", b[i]); }
+/* the owner's signature (r || s, 64 bytes as 128 hex characters) over SHA-256(msg) */
+static int sig_ok(const char *msg, size_t n, const char *sighex) {
+    unsigned char sig[64], dig[32]; int ok = 0;
+    if (!sighex || strlen(sighex) != 128) return 0;
+    for (int i = 0; i < 64; i++) { unsigned v; if (sscanf(sighex + i * 2, "%2x", &v) != 1) return 0; sig[i] = (unsigned char)v; }
+    if (!sha256_buf(msg, n, dig)) return 0;
+    BCRYPT_ALG_HANDLE a; BCRYPT_KEY_HANDLE k;
+    if (BCryptOpenAlgorithmProvider(&a, BCRYPT_ECDSA_P256_ALGORITHM, NULL, 0)) return 0;
+    struct { BCRYPT_ECCKEY_BLOB h; unsigned char xy[64]; } blob;
+    blob.h.dwMagic = BCRYPT_ECDSA_PUBLIC_P256_MAGIC; blob.h.cbKey = 32; memcpy(blob.xy, FILES_PUB, 64);
+    if (!BCryptImportKeyPair(a, NULL, BCRYPT_ECCPUBLIC_BLOB, &k, (PUCHAR)&blob, sizeof blob, 0)) {
+        ok = BCryptVerifySignature(k, NULL, dig, 32, sig, 64, 0) == 0;
+        BCryptDestroyKey(k); }
+    BCryptCloseAlgorithmProvider(a, 0);
+    return ok;
+}
+static int is_hex(const char *s, int n) { for (int i = 0; i < n; i++) if (!isxdigit((unsigned char)s[i]) || isupper((unsigned char)s[i])) return 0; return 1; }
+static int fe_cmp(const void *a, const void *b) { return strcmp(((const FileEnt *)a)->p, ((const FileEnt *)b)->p); }
+/* What the owner signs (the backend's /launcher/canonical shows the same text):
+     "PSO-FILES-1\n", then for every file sorted by path "path<TAB>size<TAB>sha256\n", then "@launcher<TAB>size<TAB>sha256\n"
+   when the server hands out a launcher. Version number and patch notes are not part of it (they change nothing on disk). */
+static int verify_list(const char *sighex, LONGLONG self_s, const char *self_h2) {
+    FileEnt *srt = malloc((size_t)g_nfiles * sizeof(FileEnt)); if (!srt) return 0;
+    memcpy(srt, g_files, (size_t)g_nfiles * sizeof(FileEnt)); qsort(srt, g_nfiles, sizeof(FileEnt), fe_cmp);
+    size_t cap = (size_t)g_nfiles * 500 + 256, n = 0; char *t = malloc(cap); int ok = 0;
+    if (t) {
+        n += sprintf(t + n, "PSO-FILES-1\n");
+        for (int i = 0; i < g_nfiles; i++) n += sprintf(t + n, "%s\t%lld\t%s\n", srt[i].p, srt[i].s, srt[i].h2);
+        if (self_s > 0) n += sprintf(t + n, "@launcher\t%lld\t%s\n", self_s, self_h2);
+        ok = sig_ok(t, n, sighex);
+        free(t); }
+    free(srt);
+    return ok;
 }
 
 static int parse_manifest(const char *js) {
     double v;
     if (!json_num(js, "version", &v)) return 0;
     g_version = (int)v;
+    g_signed = 0;
     g_cdn[0] = 0;
     { const char *c = strstr(js, "\"cdn\": \""); if (c) { c += 8; int k = 0; while (*c && *c != '"' && k < 120 && (isalnum((unsigned char)*c) || *c == '.' || *c == '-')) g_cdn[k++] = (wchar_t)*c++; g_cdn[k] = 0; if (*c != '"') g_cdn[0] = 0; } }
     int cap = 256; g_nfiles = 0;
@@ -271,10 +308,26 @@ static int parse_manifest(const char *js) {
         if (!hp) return 0;
         memcpy(e->h, hp + 6, 40); e->h[40] = 0;
         p = hp + 46;
-        { const char *nx = strstr(p, "{\"p\": \""), *cm = strstr(p, "\"c\": 1"); e->cdn = cm && (!nx || cm < nx); }
+        const char *nx = strstr(p, "{\"p\": \""), *h2 = strstr(p, "\"h2\": \"");
+        if (!h2 || (nx && h2 > nx) || !is_hex(h2 + 7, 64)) return 0;   /* build 26: SHA-256 required */
+        memcpy(e->h2, h2 + 7, 64); e->h2[64] = 0;
+        { const char *cm = strstr(p, "\"c\": 1"); e->cdn = cm && (!nx || cm < nx); }
         g_nfiles++;
     }
-    return g_nfiles > 0;
+    if (g_nfiles <= 0) return 0;
+    /* the owner's signature over the list (and the launcher it names) */
+    LONGLONG ss = 0; char sh[65] = "";
+    const char *sf = strstr(js, "\"self\": {");
+    if (sf) { double d; const char *q = strstr(sf, "\"h2\": \"");
+        if (json_num(sf, "s", &d) && q && is_hex(q + 7, 64)) { ss = (LONGLONG)d; memcpy(sh, q + 7, 64); sh[64] = 0; } }
+    char sig[129] = ""; const char *sg = strstr(js, "\"sig\": \"");
+    if (sg && is_hex(sg + 8, 128) && sg[136] == '"') { memcpy(sig, sg + 8, 128); sig[128] = 0; }
+    g_signed = sig[0] && verify_list(sig, ss, sh);
+    EnterCriticalSection(&g_selfcs);
+    if (g_signed) { g_self_s = ss; strcpy(g_self_h2, sh); }
+    LeaveCriticalSection(&g_selfcs);
+    llog("file list version %d: %d files, signature %s", g_version, g_nfiles, g_signed ? "valid" : sig[0] ? "INVALID" : "missing");
+    return 1;
 }
 
 /* mark which files must be downloaded; returns bytes needed */
@@ -289,9 +342,9 @@ static LONGLONG check_files(void) {
             const char *known = NULL;
             for (int k = 0; k < g_ncache; k++)
                 if (g_cache[k].s == s && g_cache[k].mt == mt && !strcmp(g_cache[k].p, e->p)) { known = g_cache[k].h; break; }
-            char h[41];
-            if (known) e->need = strcmp(known, e->h) != 0;
-            else if (sha1_file(fp, h, 1)) e->need = strcmp(h, e->h) != 0;
+            char h[65];
+            if (known) e->need = strcmp(known, e->h2) != 0;
+            else if (sha256_file(fp, h, 1)) e->need = strcmp(h, e->h2) != 0;
         }
         if (e->need) need += e->s;
     }
@@ -455,8 +508,8 @@ static int download_file(FileEnt *e) {
         if (!ok || have != e->s) return 0;
     }
 check:;
-    char h[41];
-    if (!sha1_file(part, h, 0) || strcmp(h, e->h)) { DeleteFileW(part); if (from_cdn) e->cdn = 0; return 0; }
+    char h[65];
+    if (!g_signed || !sha256_file(part, h, 0) || strcmp(h, e->h2)) { DeleteFileW(part); if (from_cdn) e->cdn = 0; return 0; }
     SetFileAttributesW(fp, FILE_ATTRIBUTE_NORMAL);
     if (!MoveFileExW(part, fp, MOVEFILE_REPLACE_EXISTING)) return 0;
     e->need = 0;
@@ -522,7 +575,10 @@ static DWORD WINAPI worker(LPVOID u) {
         if (!info || code != 200) {
             free(info);
             g_online = 0;
-            set_status(ST_OFFLINE, L"Can't reach the server. Check your internet connection, then press Retry.");
+            if (!info && tls_error(g_net_err))
+                set_status(ST_OFFLINE, L"Can't make a secure connection to the server (its certificate couldn't be verified). Nothing is downloaded until it can. Press Retry.");
+            else
+                set_status(ST_OFFLINE, L"Can't reach the server. Check your internet connection, then press Retry.");
             wait_click(30);
             continue;
         }
@@ -558,6 +614,11 @@ static DWORD WINAPI worker(LPVOID u) {
 
         set_status(ST_CHECKING, L"Checking game files...");
         LONGLONG need = check_files();
+        if (need && !g_signed) {                 /* build 26: nothing is downloaded from a list the owner didn't sign */
+            set_status(ST_ERROR, L"This update isn't signed by the server owner yet, so it isn't downloaded (that keeps your PC safe). Trying again in a minute...");
+            wait_click(60);
+            continue;
+        }
         if (!need) {
             g_installed_once = 1;                    /* (also when the chosen folder already had the whole game in it) */
             save_state(); save_cache();
@@ -1943,7 +2004,14 @@ static DWORD WINAPI selfupd_thread(LPVOID u) {
     DeleteFileW(nw);
     for (int round = 0;; round++) {
         for (int t = 0; !g_online && t < 600; t++) Sleep(200);
-        size_t n = 0; unsigned char *b = g_online ? http_get_bin(L"/download", &n) : NULL;
+        LONGLONG want_s; char want_h[65];
+        EnterCriticalSection(&g_selfcs); want_s = g_self_s; strcpy(want_h, g_self_h2); LeaveCriticalSection(&g_selfcs);
+        size_t n = 0; unsigned char *b = g_online && want_s > 0 ? http_get_bin(L"/download", &n) : NULL;
+        if (b) {                                                         /* build 26: exactly the file the owner signed, or nothing */
+            unsigned char d[32]; char hx[65];
+            if ((LONGLONG)n != want_s || !sha256_buf(b, n, d)) { free(b); b = NULL; }
+            else { hex_of(d, 32, hx); if (strcmp(hx, want_h)) { llog("launcher update: not the signed file, ignored"); free(b); b = NULL; } }
+        }
         int got = b && su_valid(b, n) ? su_build(b, n) : 0;
         if (got > PSO_BUILD) {
             for (int quiet = 0; quiet < 4; ) { quiet = su_quiet() ? quiet + 1 : 0; Sleep(250); }      /* a calm second first (and never while playing) */
@@ -1982,8 +2050,10 @@ static DWORD WINAPI selfupd_thread(LPVOID u) {
     }
 }
 
+static int steam_running(void);
 static DWORD WINAPI side_worker(LPVOID u) {
     (void)u;
+    for (int t = 0; t < 1800 && !steam_running(); t++) Sleep(2000);   /* build 26: Steam's files are read only once Steam runs */
     read_steam_info();
     if (g_steam.ok) {
         void *a = load_image_file(g_steam.avatar_path);
@@ -2002,7 +2072,7 @@ int WINAPI wWinMain(HINSTANCE hi, HINSTANCE prev, LPWSTR cmd, int show) {
     typedef BOOL (WINAPI *ctx_fn)(HANDLE);
     ctx_fn setctx = (ctx_fn)GetProcAddress(u32, "SetProcessDpiAwarenessContext");
     if (!setctx || !setctx((HANDLE)-4 /* PER_MONITOR_AWARE_V2 */)) SetProcessDPIAware();
-    InitializeCriticalSection(&g_cs); InitializeCriticalSection(&g_imgcs);
+    InitializeCriticalSection(&g_cs); InitializeCriticalSection(&g_imgcs); InitializeCriticalSection(&g_selfcs);
     { wchar_t me[MAX_PATH], old[MAX_PATH + 8]; if (GetModuleFileNameW(NULL, me, MAX_PATH)) { swprintf(old, MAX_PATH + 8, L"%ls.old", me); DeleteFileW(old); } }   /* left by an update */
     (void)g_build_tag;
     { ULONG_PTR tok; GpStartupInput gi = { 1, NULL, FALSE, FALSE }; GdiplusStartup(&tok, &gi, NULL); }
